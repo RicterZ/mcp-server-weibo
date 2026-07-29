@@ -72,9 +72,11 @@ class WeiboCrawler:
     async def _validate_cookies(self, cookies: dict) -> bool:
         try:
             async with httpx.AsyncClient(cookies=cookies, follow_redirects=True, trust_env=False) as client:
-                response = await client.get("https://weibo.com/ajax/config/get_config", headers=WEB_HEADERS)
+                response = await client.get("https://m.weibo.cn/api/config", headers=DEFAULT_HEADERS)
                 response.raise_for_status()
                 data = response.json().get("data", {})
+                if data.get("st"):
+                    cookies["XSRF-TOKEN"] = data["st"]
                 return bool(data.get("login") and data.get("uid"))
         except (httpx.HTTPError, ValueError):
             return False
@@ -121,9 +123,11 @@ class WeiboCrawler:
             return {"login": False, "uid": None}
         try:
             async with httpx.AsyncClient(cookies=self.cookies, follow_redirects=True, trust_env=False) as client:
-                response = await client.get("https://weibo.com/ajax/config/get_config", headers=WEB_HEADERS)
+                response = await client.get("https://m.weibo.cn/api/config", headers=DEFAULT_HEADERS)
                 response.raise_for_status()
                 data = response.json().get("data", {})
+                if data.get("st"):
+                    self.cookies["XSRF-TOKEN"] = data["st"]
                 return {"login": bool(data.get("login")), "uid": data.get("uid")}
         except (httpx.HTTPError, ValueError):
             return {"login": False, "uid": None}
@@ -180,16 +184,20 @@ class WeiboCrawler:
                 retcode = payload.get("retcode")
                 if retcode == 20000000:
                     data = payload.get("data", {})
-                    if cross_url := data.get("url"):
-                        await client.get(cross_url)
                     if alt := data.get("alt"):
-                        await client.get(
-                            "https://login.sina.com.cn/sso/login.php",
-                            params={"entry": "miniblog", "alt": alt, "returntype": "TEXT"},
+                        response = await client.get(
+                            "/sso/v2/login",
+                            params={"entry": "miniblog", "alt": alt, "returntype": "META"},
                         )
+                        response.raise_for_status()
+                    elif cross_url := data.get("url"):
+                        await client.get(cross_url)
                     cookies = {cookie.name: cookie.value for cookie in client.cookies.jar}
                     if not await self._validate_cookies(cookies):
-                        raise RuntimeError("QR scan completed, but Weibo did not create a valid session")
+                        names = ", ".join(sorted(cookies)) or "none"
+                        raise RuntimeError(
+                            f"QR scan completed, but Weibo did not create a valid session (cookie names: {names})"
+                        )
                     self.save_cookies(cookies)
                     return await self.get_session()
                 if retcode == 50114002 and not scanned:

@@ -30,8 +30,8 @@ async def test_home_timeline_and_friendship_requests(tmp_path, monkeypatch):
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        if request.url.path == "/ajax/config/get_config":
-            return httpx.Response(200, json={"data": {"login": True, "uid": "123"}})
+        if request.url.path == "/api/config":
+            return httpx.Response(200, json={"data": {"login": True, "uid": "123", "st": "fresh-csrf"}})
         if request.url.path == "/ajax/feed/friendstimeline":
             return httpx.Response(200, json={"statuses": [{
                 "id": 1,
@@ -63,6 +63,50 @@ async def test_home_timeline_and_friendship_requests(tmp_path, monkeypatch):
         "/ajax/friendships/create",
         "/ajax/friendships/destory",
     ]
-    assert all(request.headers["x-xsrf-token"] == "csrf-token" for request in writes)
+    assert all(request.headers["x-xsrf-token"] == "fresh-csrf" for request in writes)
     assert json.loads(writes[0].content)["friend_uid"] == "456"
     assert json.loads(writes[1].content)["uid"] == "456"
+
+
+@pytest.mark.asyncio
+async def test_qr_login_exchanges_alt_and_saves_valid_session(tmp_path, monkeypatch):
+    monkeypatch.delenv("WEIBO_COOKIE", raising=False)
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/sso/signin":
+            return httpx.Response(200, headers={"set-cookie": "X-CSRF-TOKEN=csrf; Path=/"})
+        if request.url.path == "/sso/v2/qrcode/image":
+            return httpx.Response(200, json={
+                "retcode": 20000000,
+                "data": {"qrid": "qr", "image": "https://example/qrcode?data=https%3A%2F%2Fscan"},
+            })
+        if request.url.path == "/sso/v2/qrcode/check":
+            return httpx.Response(200, json={"retcode": 20000000, "data": {"alt": "ticket"}})
+        if request.url.path == "/sso/v2/login":
+            return httpx.Response(200, headers={"set-cookie": "SUB=user-session; Domain=.weibo.com; Path=/"})
+        if request.url.path == "/api/config":
+            return httpx.Response(200, json={
+                "ok": 1,
+                "data": {"login": True, "uid": "123", "st": "fresh-csrf"},
+            })
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    real_client = httpx.AsyncClient
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(
+        weibo.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=transport, **kwargs),
+    )
+    monkeypatch.setattr(weibo.qrcode.QRCode, "print_ascii", lambda self, **kwargs: None)
+
+    cookie_file = tmp_path / "cookies.json"
+    session = await WeiboCrawler(cookie_file).qr_login(timeout=1)
+
+    assert session == {"login": True, "uid": "123"}
+    assert any(request.url.path == "/sso/v2/login" for request in requests)
+    saved = json.loads(cookie_file.read_text())["cookies"]
+    assert saved["SUB"] == "user-session"
+    assert saved["XSRF-TOKEN"] == "fresh-csrf"
