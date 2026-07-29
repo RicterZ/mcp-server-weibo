@@ -32,12 +32,15 @@ async def test_home_timeline_and_friendship_requests(tmp_path, monkeypatch):
         requests.append(request)
         if request.url.path == "/api/config":
             return httpx.Response(200, json={"data": {"login": True, "uid": "123", "st": "fresh-csrf"}})
-        if request.url.path == "/api/statuses/friends_timeline":
-            return httpx.Response(200, json={"ok": 1, "data": {"statuses": [{
-                "id": 1,
-                "text_raw": "首页内容",
-                "user": {"id": 2, "screen_name": "用户"},
-            }]}})
+        if request.url.path == "/ajax/feed/friendstimeline":
+            timeline_call = sum(r.url.path == request.url.path for r in requests)
+            text = "第一页" if timeline_call == 1 else "首页内容"
+            return httpx.Response(200, json={
+                "ok": 1,
+                "max_id_str": "next-page",
+                "statuses": [{"id": timeline_call, "text_raw": text,
+                              "user": {"id": 2, "screen_name": "用户"}}],
+            })
         if request.url.path == "/":
             return httpx.Response(200)
         if request.url.path in ("/ajax/friendships/create", "/ajax/friendships/destory"):
@@ -55,9 +58,11 @@ async def test_home_timeline_and_friendship_requests(tmp_path, monkeypatch):
     crawler = WeiboCrawler(tmp_path / "cookies.json")
     timeline = await crawler.get_home_timeline(limit=1, page=2)
     assert timeline[0].text == "首页内容"
-    timeline_request = next(request for request in requests if request.url.path == "/api/statuses/friends_timeline")
-    assert timeline_request.url.params["page"] == "2"
-    assert timeline_request.headers["x-xsrf-token"] == "fresh-csrf"
+    timeline_requests = [request for request in requests if request.url.path == "/ajax/feed/friendstimeline"]
+    assert len(timeline_requests) == 2
+    assert timeline_requests[0].url.params["list_id"] == "0"
+    assert timeline_requests[0].url.params["since_id"] == "0"
+    assert timeline_requests[1].url.params["max_id"] == "next-page"
     await crawler.follow_user(456)
     await crawler.unfollow_user(456)
 

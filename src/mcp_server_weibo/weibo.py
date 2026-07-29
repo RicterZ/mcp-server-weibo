@@ -217,25 +217,34 @@ class WeiboCrawler:
     async def get_home_timeline(self, limit: int = 20, page: int = 1) -> list[FeedItem]:
         """Get the logged-in user's following timeline."""
         await self._require_authenticated()
-        token = self.cookies.get("XSRF-TOKEN", "")
         async with httpx.AsyncClient(cookies=self.cookies, follow_redirects=True, trust_env=False) as client:
-            response = await client.get(
-                "https://m.weibo.cn/api/statuses/friends_timeline",
-                params={"page": max(page, 1), "count": min(max(limit, 1), 50), "feature": 0},
-                headers={
-                    **DEFAULT_HEADERS,
-                    "Origin": "https://m.weibo.cn",
-                    "X-Requested-With": "XMLHttpRequest",
-                    "X-XSRF-TOKEN": token,
-                    "X-CSRF-TOKEN": token,
-                },
-            )
-            response.raise_for_status()
-            payload = response.json()
-            if payload.get("ok") == 0:
-                raise RuntimeError(payload.get("msg", "Unable to fetch Weibo home timeline"))
-            statuses = (payload.get("data") or payload).get("statuses", [])
-            return [self._to_feed_item(status) for status in statuses[:limit] if status.get("id") or status.get("idstr")]
+            max_id = "0"
+            for current_page in range(1, max(page, 1) + 1):
+                params = {
+                    "list_id": 0,
+                    "refresh": 4,
+                    "since_id": 0,
+                    "count": min(max(limit, 1), 50),
+                }
+                if max_id != "0":
+                    params["max_id"] = max_id
+                response = await client.get(
+                    "https://weibo.com/ajax/feed/friendstimeline",
+                    params=params,
+                    headers={**WEB_HEADERS, "X-Requested-With": "XMLHttpRequest"},
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if payload.get("ok") != 1:
+                    raise RuntimeError(payload.get("message") or payload.get("msg") or "Unable to fetch Weibo home timeline")
+                statuses = payload.get("statuses") or []
+                if current_page == max(page, 1):
+                    return [self._to_feed_item(status) for status in statuses[:limit]
+                        if status.get("id") or status.get("idstr")]
+                max_id = str(payload.get("max_id_str") or payload.get("max_id") or "0")
+                if not statuses or max_id == "0":
+                    return []
+        return []
 
     async def follow_user(self, uid: int) -> dict:
         """Follow a user as the logged-in account."""
