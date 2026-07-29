@@ -2,8 +2,8 @@ from fastmcp import FastMCP, Context
 from .weibo import WeiboCrawler
 from typing import Annotated
 from pydantic import Field
-from pathlib import Path
 import argparse
+import asyncio
 import os
 
 # Initialize FastMCP server with name "Weibo"
@@ -162,6 +162,36 @@ async def get_comments(
     """
     return await get_crawler().get_comments(feed_id, page)
 
+@mcp.tool()
+async def get_session(ctx: Context) -> dict:
+    """Check whether the configured Cookie is a valid real-user session."""
+    return await get_crawler().get_session()
+
+@mcp.tool()
+async def get_home_timeline(
+    ctx: Context,
+    limit: Annotated[int, Field(description="Maximum number of followed-user posts, defaults to 20")] = 20,
+    max_id: Annotated[str, Field(description="Pagination cursor returned by Weibo; use 0 for the newest posts")] = "0",
+) -> list[dict]:
+    """Get the logged-in user's home/following timeline."""
+    return await get_crawler().get_home_timeline(limit, max_id)
+
+@mcp.tool()
+async def follow_user(
+    ctx: Context,
+    uid: Annotated[int, Field(description="UID of the user to follow")],
+) -> dict:
+    """Follow a Weibo user as the logged-in account."""
+    return await get_crawler().follow_user(uid)
+
+@mcp.tool()
+async def unfollow_user(
+    ctx: Context,
+    uid: Annotated[int, Field(description="UID of the user to unfollow")],
+) -> dict:
+    """Unfollow a Weibo user as the logged-in account."""
+    return await get_crawler().unfollow_user(uid)
+
 def run_as_streamable_http():
     """
     Run the MCP server using streamable-http transport, allowing custom port configuration via the PORT environment variable.
@@ -180,24 +210,30 @@ def main():
     parser.add_argument(
         "--cookie",
         type=str,
-        help="Weibo cookie string. Will be saved to tests/.env file."
+        help="Import a browser Cookie into the private credential file."
     )
     parser.add_argument(
         "mode",
         nargs="?",
-        choices=["stdio", "http"],
+        choices=["stdio", "http", "login"],
         default="stdio",
         help="Server mode: 'stdio' or 'http' (default: stdio)"
     )
     args = parser.parse_args()
 
     if args.cookie:
-        env_file = Path(__file__).parent / ".env"
-        env_file.write_text(f"WEIBO_COOKIE={args.cookie}\n")
-        print(f"Cookie saved to {env_file}")
+        crawler = WeiboCrawler()
+        cookies = crawler.parse_cookie(args.cookie)
+        if not cookies:
+            parser.error("--cookie is not a valid Cookie header")
+        crawler.save_cookies(cookies)
+        print(f"Cookie saved to {crawler.cookie_file}")
         return
 
-    if args.mode == "http":
+    if args.mode == "login":
+        session = asyncio.run(WeiboCrawler().qr_login())
+        print(f"登录成功，UID: {session['uid']}")
+    elif args.mode == "http":
         run_as_streamable_http()
     else:
         run_as_stdio()

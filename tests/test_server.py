@@ -100,6 +100,10 @@ class TestServerTools:
             "get_followers",
             "get_fans",
             "get_comments",
+            "get_session",
+            "get_home_timeline",
+            "follow_user",
+            "unfollow_user",
         ]
 
         registered_tools = list(mcp._tool_manager._tools.keys())

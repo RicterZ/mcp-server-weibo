@@ -1,12 +1,29 @@
-import httpx
-import re
+import asyncio
+from http.cookies import SimpleCookie
+import json
 import logging
 import os
+import re
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urlparse
+
+import httpx
+import qrcode
+
 from mcp_server_weibo.consts import DEFAULT_HEADERS, PROFILE_URL, FEEDS_URL, SEARCH_URL, COMMENTS_URL
 from mcp_server_weibo.schemas import PagedFeeds, TrendingItem, FeedItem, UserProfile, CommentItem
-import json
+
+
+WEB_HEADERS = {
+    **DEFAULT_HEADERS,
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://weibo.com/",
+}
+PASSPORT_HEADERS = {
+    **WEB_HEADERS,
+    "Referer": "https://passport.weibo.com/sso/signin?entry=miniblog&source=miniblog&url=https://weibo.com/",
+    "X-Requested-With": "XMLHttpRequest",
+}
 
 
 class WeiboCrawler:
@@ -14,28 +31,59 @@ class WeiboCrawler:
     A crawler class for extracting data from Weibo (Chinese social media platform).
     Provides functionality to fetch user profiles, feeds, and search for users.
 
-    Cookie can be provided via WEIBO_COOKIE environment variable or .env file.
+    Cookie can be provided via WEIBO_COOKIE or a persistent JSON file.
     """
     COOKIE_ENV = "WEIBO_COOKIE"
+    COOKIE_FILE_ENV = "WEIBO_COOKIE_FILE"
+    DEFAULT_COOKIE_FILE = Path.home() / ".config" / "mcp-server-weibo" / "cookies.json"
 
-    def __init__(self):
+    def __init__(self, cookie_file: str | Path | None = None):
         self.logger = logging.getLogger(__name__)
-        self.cookies = None
-    
+        self.cookie_file = Path(cookie_file or os.environ.get(self.COOKIE_FILE_ENV, self.DEFAULT_COOKIE_FILE)).expanduser()
+        self.cookies = self._load_cookies()
+
+    @staticmethod
+    def parse_cookie(cookie_header: str) -> dict[str, str]:
+        parsed = SimpleCookie()
+        parsed.load(cookie_header)
+        return {name: morsel.value for name, morsel in parsed.items()}
+
+    def _load_cookies(self) -> dict[str, str] | None:
+        if cookie_header := os.environ.get(self.COOKIE_ENV):
+            cookies = self.parse_cookie(cookie_header)
+            if cookies:
+                return cookies
+        if not self.cookie_file.exists():
+            return None
+        try:
+            data = json.loads(self.cookie_file.read_text())
+            cookies = data.get("cookies", data)
+            return cookies if isinstance(cookies, dict) and cookies else None
+        except (OSError, json.JSONDecodeError):
+            self.logger.warning("Unable to load Weibo cookies from %s", self.cookie_file)
+            return None
+
+    def save_cookies(self, cookies: dict[str, str]) -> None:
+        self.cookie_file.parent.mkdir(parents=True, exist_ok=True)
+        self.cookie_file.write_text(json.dumps({"cookies": cookies}, ensure_ascii=False))
+        self.cookie_file.chmod(0o600)
+        self.cookies = cookies
+
     async def _validate_cookies(self, cookies: dict) -> bool:
         try:
-            async with httpx.AsyncClient(cookies=cookies, follow_redirects=False) as client:
-                response = await client.get("https://m.weibo.cn/", headers=DEFAULT_HEADERS)
-                location = response.headers.get("location", "")
-                if response.status_code in (301, 302, 303, 307, 308) and "visitor.passport.weibo.cn" in location:
-                    return False
-                return True
-        except httpx.HTTPError:
+            async with httpx.AsyncClient(cookies=cookies, follow_redirects=True, trust_env=False) as client:
+                response = await client.get("https://weibo.com/ajax/config/get_config", headers=WEB_HEADERS)
+                response.raise_for_status()
+                data = response.json().get("data", {})
+                return bool(data.get("login") and data.get("uid"))
+        except (httpx.HTTPError, ValueError):
             return False
-        
+
     async def _ensure_cookies(self, retry: bool = False) -> dict:
+        if self.cookies:
+            return self.cookies
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(trust_env=False) as client:
                 response = await client.post(
                     "https://visitor.passport.weibo.cn/visitor/genvisitor2",
                     data={
@@ -58,16 +106,145 @@ class WeiboCrawler:
                 if not sub or not subp:
                     raise ValueError("Missing SUB/SUBP in visitor passport response")
 
-                generated = {"SUB": sub, "SUBP": subp}
-                if not await self._validate_cookies(generated):
-                    raise ValueError("Generated visitor cookies are invalid")
-                self.cookies = generated
+                self.cookies = {"SUB": sub, "SUBP": subp}
+                return self.cookies
         except (httpx.HTTPError, json.JSONDecodeError, ValueError):
             self.logger.error("Unable to initialize Weibo visitor cookies", exc_info=True)
             self.cookies = None
             if not retry:
                 return await self._ensure_cookies(retry=True)
             raise
+
+    async def get_session(self) -> dict:
+        """Return the current real-user login state without exposing cookies."""
+        if not self.cookies:
+            return {"login": False, "uid": None}
+        try:
+            async with httpx.AsyncClient(cookies=self.cookies, follow_redirects=True, trust_env=False) as client:
+                response = await client.get("https://weibo.com/ajax/config/get_config", headers=WEB_HEADERS)
+                response.raise_for_status()
+                data = response.json().get("data", {})
+                return {"login": bool(data.get("login")), "uid": data.get("uid")}
+        except (httpx.HTTPError, ValueError):
+            return {"login": False, "uid": None}
+
+    async def _require_authenticated(self) -> None:
+        if not (await self.get_session()).get("login"):
+            raise RuntimeError("Weibo login is missing or expired; run `mcp-server-weibo login`")
+
+    async def qr_login(self, timeout: int = 240) -> dict:
+        """Log in with the Weibo app QR scanner and persist the resulting cookies."""
+        params = {"entry": "miniblog", "source": "miniblog", "url": "https://weibo.com/"}
+        async with httpx.AsyncClient(
+            base_url="https://passport.weibo.com",
+            headers=PASSPORT_HEADERS,
+            follow_redirects=True,
+            timeout=30,
+            trust_env=False,
+        ) as client:
+            response = await client.get("/sso/signin", params=params)
+            response.raise_for_status()
+            csrf = self._cookie_value(client.cookies, "X-CSRF-TOKEN")
+            if not csrf:
+                raise RuntimeError("Weibo did not return a QR login CSRF token")
+            client.headers["X-CSRF-TOKEN"] = csrf
+
+            response = await client.get("/sso/v2/qrcode/image", params={"entry": "miniblog", "size": "180"})
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("retcode") != 20000000:
+                raise RuntimeError(payload.get("msg", "Unable to create Weibo login QR code"))
+            qrid = payload["data"]["qrid"]
+            image_url = payload["data"].get("image", "")
+            scan_url = parse_qs(urlparse(image_url).query).get(
+                "data", [f"https://passport.weibo.cn/signin/qrcode/scan?qr={qrid}"]
+            )[0]
+
+            print("\n请使用微博 App 扫描二维码，并在手机上确认登录：\n")
+            qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_L, border=1)
+            qr.add_data(scan_url)
+            qr.make(fit=True)
+            qr.print_ascii(invert=True)
+            print("\n等待扫码（最多 4 分钟）…", flush=True)
+
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout
+            scanned = False
+            while loop.time() < deadline:
+                response = await client.get(
+                    "/sso/v2/qrcode/check",
+                    params={**params, "qrid": qrid, "rid": "", "ver": "20250520"},
+                )
+                response.raise_for_status()
+                payload = response.json()
+                retcode = payload.get("retcode")
+                if retcode == 20000000:
+                    data = payload.get("data", {})
+                    if cross_url := data.get("url"):
+                        await client.get(cross_url)
+                    if alt := data.get("alt"):
+                        await client.get(
+                            "https://login.sina.com.cn/sso/login.php",
+                            params={"entry": "miniblog", "alt": alt, "returntype": "TEXT"},
+                        )
+                    cookies = {cookie.name: cookie.value for cookie in client.cookies.jar}
+                    if not await self._validate_cookies(cookies):
+                        raise RuntimeError("QR scan completed, but Weibo did not create a valid session")
+                    self.save_cookies(cookies)
+                    return await self.get_session()
+                if retcode == 50114002 and not scanned:
+                    print("已扫码，请在手机上确认…", flush=True)
+                    scanned = True
+                elif retcode == 50114004:
+                    raise RuntimeError("Weibo login QR code expired")
+                elif retcode not in (50114001, 50114002):
+                    raise RuntimeError(payload.get("msg", f"QR login failed ({retcode})"))
+                await asyncio.sleep(2)
+        raise RuntimeError("Weibo login QR code timed out")
+
+    @staticmethod
+    def _cookie_value(cookies: httpx.Cookies, name: str) -> str | None:
+        return next((cookie.value for cookie in cookies.jar if cookie.name == name), None)
+
+    async def get_home_timeline(self, limit: int = 20, max_id: str = "0") -> list[FeedItem]:
+        """Get the logged-in user's following timeline."""
+        await self._require_authenticated()
+        async with httpx.AsyncClient(cookies=self.cookies, follow_redirects=True, trust_env=False) as client:
+            response = await client.get(
+                "https://weibo.com/ajax/feed/friendstimeline",
+                params={"count": min(max(limit, 1), 50), "max_id": max_id},
+                headers=WEB_HEADERS,
+            )
+            response.raise_for_status()
+            statuses = response.json().get("statuses", [])
+            return [self._to_feed_item(status) for status in statuses[:limit]]
+
+    async def follow_user(self, uid: int) -> dict:
+        """Follow a user as the logged-in account."""
+        return await self._friendship_action("create", uid, "friend_uid")
+
+    async def unfollow_user(self, uid: int) -> dict:
+        """Unfollow a user as the logged-in account."""
+        # Weibo's real endpoint intentionally misspells "destroy" as "destory".
+        return await self._friendship_action("destory", uid, "uid")
+
+    async def _friendship_action(self, action: str, uid: int, uid_field: str) -> dict:
+        await self._require_authenticated()
+        async with httpx.AsyncClient(cookies=self.cookies, follow_redirects=True, trust_env=False) as client:
+            await client.get("https://weibo.com/", headers=WEB_HEADERS)
+            xsrf = self._cookie_value(client.cookies, "XSRF-TOKEN")
+            if not xsrf:
+                raise RuntimeError("Weibo session is missing XSRF-TOKEN; log in again")
+            response = await client.post(
+                f"https://weibo.com/ajax/friendships/{action}",
+                json={uid_field: str(uid), "lpage": "profile", "page": "profile"},
+                headers={**WEB_HEADERS, "X-XSRF-TOKEN": xsrf},
+            )
+            response.raise_for_status()
+            data = response.json()
+            if data.get("ok") != 1:
+                raise RuntimeError(data.get("msg", f"Weibo friendship {action} failed"))
+            return data
 
 
     async def get_profile(self, uid: int) -> UserProfile:
@@ -503,6 +680,14 @@ class WeiboCrawler:
             'pics', []) if 'url' in pic] if mblog.get('pics') else []
         pics=[{'thumbnail': pic['url'], 'large': pic['large']['url']}
             for pic in pics] if pics else []
+        if not pics and mblog.get('pic_infos'):
+            pics = [
+                {
+                    'thumbnail': info.get('thumbnail', {}).get('url', ''),
+                    'large': info.get('largest', info.get('large', {})).get('url', ''),
+                }
+                for info in mblog['pic_infos'].values()
+            ]
 
         videos={}
         page_info=mblog.get('page_info')
@@ -522,9 +707,9 @@ class WeiboCrawler:
             mblog.get('user', {})) if mblog.get('user') else {}
         return FeedItem(
             id=mblog.get('id'),
-            text=mblog.get('text'),
-            source=mblog.get('source'),
-            created_at=mblog.get('created_at'),
+            text=mblog.get('text') or mblog.get('text_raw', ''),
+            source=mblog.get('source', ''),
+            created_at=mblog.get('created_at', ''),
             user=user,
             comments_count=mblog.get('comments_count', 0),
             attitudes_count=mblog.get('attitudes_count', 0),
@@ -547,9 +732,9 @@ class WeiboCrawler:
         """
         return UserProfile(
             id=user['id'],
-            screen_name=user['screen_name'],
-            profile_image_url=user['profile_image_url'],
-            profile_url=user['profile_url'],
+            screen_name=user.get('screen_name', ''),
+            profile_image_url=user.get('profile_image_url', user.get('avatar_large', '')),
+            profile_url=user.get('profile_url', f"/u/{user['id']}"),
             description=user.get('description', ''),
             follow_count=user.get('follow_count', 0),
             followers_count=user.get('followers_count', ''),

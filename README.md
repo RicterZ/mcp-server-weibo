@@ -4,7 +4,7 @@
 
 ## 安装
 
-**自动 Cookie 获取：** 无需手动配置 Cookie，程序会自动通过微博访客通行证生成有效的访问凭证。
+公开查询无需登录；首页 timeline、关注和取关需要真实微博账号 Cookie。
 
 ### 方式一：从包管理器安装（推荐）
 
@@ -17,7 +17,20 @@ mcp-server-weibo stdio
 
 # 以 http 模式运行
 mcp-server-weibo http
+
+# 扫码登录（微博 App 扫码并确认）
+mcp-server-weibo login
 ```
+
+扫码成功后 Cookie 保存在 `~/.config/mcp-server-weibo/cookies.json`，文件权限为 `0600`。也可以从浏览器开发者工具复制 Cookie：
+
+```bash
+mcp-server-weibo --cookie 'SUB=...; SUBP=...; XSRF-TOKEN=...'
+# 或仅在当前进程注入
+WEIBO_COOKIE='SUB=...; SUBP=...; XSRF-TOKEN=...' mcp-server-weibo stdio
+```
+
+用 `WEIBO_COOKIE_FILE` 可以覆盖凭证文件路径。Cookie 等同登录凭证，请勿提交到 Git 或写入普通 MCP 配置文件。
 
 MCP 客户端配置（stdio 模式）：
 ```json
@@ -37,8 +50,14 @@ MCP 客户端配置（stdio 模式）：
 # 构建镜像
 docker build -t mcp-server-weibo .
 
-# 运行容器
-docker run -p 4200:4200 mcp-server-weibo http
+# 创建持久卷，并在临时容器中扫码登录
+docker volume create weibo-data
+docker run --rm -it -v weibo-data:/data mcp-server-weibo login
+
+# 使用同一个卷启动服务；删除/重建容器不会丢失 Cookie
+docker run -d --name weibo -p 4200:4200 \
+  -v weibo-data:/data \
+  mcp-server-weibo
 ```
 
 MCP 客户端配置（HTTP 模式）：
@@ -46,7 +65,7 @@ MCP 客户端配置（HTTP 模式）：
 {
   "mcpServers": {
     "weibo": {
-      "url": "http://localhost:4200/sse"
+      "url": "http://localhost:4200/mcp"
     }
   }
 }
@@ -121,6 +140,15 @@ uvx --from mcp-server-weibo weibo-cli fans 1749127163 -n 10
 ## 组件
 
 ### 工具
+
+真实用户工具：
+
+| 工具 | 说明 |
+|------|------|
+| `get_session()` | 校验当前 Cookie，返回登录状态和 UID（不会返回 Cookie） |
+| `get_home_timeline(limit, max_id)` | 获取所关注用户的首页 timeline |
+| `follow_user(uid)` | 以当前账号关注用户 |
+| `unfollow_user(uid)` | 以当前账号取消关注用户 |
 
 #### search_users(keyword, limit)
 描述：搜索微博用户

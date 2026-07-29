@@ -30,7 +30,8 @@ def has_cookie():
 
 @pytest.fixture
 def crawler():
-    assert has_cookie(), f"Please set {COOKIE_ENV} environment variable"
+    if not has_cookie():
+        pytest.skip(f"Set {COOKIE_ENV} to run live Weibo API tests")
     return WeiboCrawler()
 
 
