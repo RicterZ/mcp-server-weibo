@@ -146,7 +146,7 @@ uvx --from mcp-server-weibo weibo-cli fans 1749127163 -n 10
 | 工具 | 说明 |
 |------|------|
 | `get_session()` | 校验当前 Cookie，返回登录状态和 UID（不会返回 Cookie） |
-| `get_home_timeline(limit, max_id)` | 获取所关注用户的首页 timeline |
+| `get_home_timeline(limit, page)` | 获取所关注用户的首页 timeline |
 | `follow_user(uid)` | 以当前账号关注用户 |
 | `unfollow_user(uid)` | 以当前账号取消关注用户 |
 

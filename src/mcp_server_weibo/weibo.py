@@ -214,18 +214,28 @@ class WeiboCrawler:
     def _cookie_value(cookies: httpx.Cookies, name: str) -> str | None:
         return next((cookie.value for cookie in cookies.jar if cookie.name == name), None)
 
-    async def get_home_timeline(self, limit: int = 20, max_id: str = "0") -> list[FeedItem]:
+    async def get_home_timeline(self, limit: int = 20, page: int = 1) -> list[FeedItem]:
         """Get the logged-in user's following timeline."""
         await self._require_authenticated()
+        token = self.cookies.get("XSRF-TOKEN", "")
         async with httpx.AsyncClient(cookies=self.cookies, follow_redirects=True, trust_env=False) as client:
             response = await client.get(
-                "https://weibo.com/ajax/feed/friendstimeline",
-                params={"count": min(max(limit, 1), 50), "max_id": max_id},
-                headers=WEB_HEADERS,
+                "https://m.weibo.cn/api/statuses/friends_timeline",
+                params={"page": max(page, 1), "count": min(max(limit, 1), 50), "feature": 0},
+                headers={
+                    **DEFAULT_HEADERS,
+                    "Origin": "https://m.weibo.cn",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "X-XSRF-TOKEN": token,
+                    "X-CSRF-TOKEN": token,
+                },
             )
             response.raise_for_status()
-            statuses = response.json().get("statuses", [])
-            return [self._to_feed_item(status) for status in statuses[:limit]]
+            payload = response.json()
+            if payload.get("ok") == 0:
+                raise RuntimeError(payload.get("msg", "Unable to fetch Weibo home timeline"))
+            statuses = (payload.get("data") or payload).get("statuses", [])
+            return [self._to_feed_item(status) for status in statuses[:limit] if status.get("id") or status.get("idstr")]
 
     async def follow_user(self, uid: int) -> dict:
         """Follow a user as the logged-in account."""
@@ -646,8 +656,9 @@ class WeiboCrawler:
             new_since_id=data.get("data", {}).get(
                 "cardlistInfo", {}).get("since_id", "")
             cards=data.get("data", {}).get("cards", [])
-            feeds=list(map(lambda x: self._to_feed_item(
-                x.get('mblog', {})), cards))
+            mblogs = [card.get('mblog') for card in cards]
+            feeds = [self._to_feed_item(mblog) for mblog in mblogs
+                if mblog and (mblog.get('id') or mblog.get('idstr'))]
 
             return PagedFeeds(SinceId=new_since_id, Feeds=feeds)
         except (httpx.HTTPError, httpx.ConnectError):
@@ -714,7 +725,7 @@ class WeiboCrawler:
         user=self._to_user_profile(
             mblog.get('user', {})) if mblog.get('user') else {}
         return FeedItem(
-            id=mblog.get('id'),
+            id=mblog.get('id') or mblog.get('idstr'),
             text=mblog.get('text') or mblog.get('text_raw', ''),
             source=mblog.get('source', ''),
             created_at=mblog.get('created_at', ''),

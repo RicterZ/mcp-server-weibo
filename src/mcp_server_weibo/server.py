@@ -171,10 +171,10 @@ async def get_session(ctx: Context) -> dict:
 async def get_home_timeline(
     ctx: Context,
     limit: Annotated[int, Field(description="Maximum number of followed-user posts, defaults to 20")] = 20,
-    max_id: Annotated[str, Field(description="Pagination cursor returned by Weibo; use 0 for the newest posts")] = "0",
+    page: Annotated[int, Field(description="Page number, defaults to 1")] = 1,
 ) -> list[dict]:
     """Get the logged-in user's home/following timeline."""
-    return await get_crawler().get_home_timeline(limit, max_id)
+    return await get_crawler().get_home_timeline(limit, page)
 
 @mcp.tool()
 async def follow_user(

@@ -32,12 +32,12 @@ async def test_home_timeline_and_friendship_requests(tmp_path, monkeypatch):
         requests.append(request)
         if request.url.path == "/api/config":
             return httpx.Response(200, json={"data": {"login": True, "uid": "123", "st": "fresh-csrf"}})
-        if request.url.path == "/ajax/feed/friendstimeline":
-            return httpx.Response(200, json={"statuses": [{
+        if request.url.path == "/api/statuses/friends_timeline":
+            return httpx.Response(200, json={"ok": 1, "data": {"statuses": [{
                 "id": 1,
                 "text_raw": "首页内容",
                 "user": {"id": 2, "screen_name": "用户"},
-            }]})
+            }]}})
         if request.url.path == "/":
             return httpx.Response(200)
         if request.url.path in ("/ajax/friendships/create", "/ajax/friendships/destory"):
@@ -53,8 +53,11 @@ async def test_home_timeline_and_friendship_requests(tmp_path, monkeypatch):
     )
 
     crawler = WeiboCrawler(tmp_path / "cookies.json")
-    timeline = await crawler.get_home_timeline(limit=1)
+    timeline = await crawler.get_home_timeline(limit=1, page=2)
     assert timeline[0].text == "首页内容"
+    timeline_request = next(request for request in requests if request.url.path == "/api/statuses/friends_timeline")
+    assert timeline_request.url.params["page"] == "2"
+    assert timeline_request.headers["x-xsrf-token"] == "fresh-csrf"
     await crawler.follow_user(456)
     await crawler.unfollow_user(456)
 
@@ -110,3 +113,25 @@ async def test_qr_login_exchanges_alt_and_saves_valid_session(tmp_path, monkeypa
     saved = json.loads(cookie_file.read_text())["cookies"]
     assert saved["SUB"] == "user-session"
     assert saved["XSRF-TOKEN"] == "fresh-csrf"
+
+
+@pytest.mark.asyncio
+async def test_feed_cards_without_mblog_are_ignored(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": {
+            "cardlistInfo": {"since_id": "next"},
+            "cards": [
+                {"card_type": 11},
+                {"card_type": 9, "mblog": {
+                    "idstr": "42",
+                    "text": "有效微博",
+                    "user": {"id": 2, "screen_name": "用户"},
+                }},
+            ],
+        }})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        page = await WeiboCrawler()._extract_feeds(client, 2, "container", "")
+
+    assert page.SinceId == "next"
+    assert [feed.id for feed in page.Feeds] == [42]
