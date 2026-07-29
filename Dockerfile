@@ -1,4 +1,4 @@
-FROM python:3.10-slim
+FROM python:3.13-slim-trixie
 
 WORKDIR /app
 
@@ -9,7 +9,7 @@ RUN pip install uv
 COPY . .
 
 # Install the locked runtime dependencies
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev --python /usr/local/bin/python3.13
 ENV PATH="/app/.venv/bin:$PATH"
 
 # Expose the port used by the MCP server (default 4200, can be overridden by PORT env)
