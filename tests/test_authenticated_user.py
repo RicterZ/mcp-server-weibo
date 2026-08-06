@@ -140,3 +140,25 @@ async def test_feed_cards_without_mblog_are_ignored(monkeypatch):
 
     assert page.SinceId == "next"
     assert [feed.id for feed in page.Feeds] == [42]
+
+
+@pytest.mark.asyncio
+async def test_expired_cookie_returns_clear_error(monkeypatch):
+    monkeypatch.setenv("WEIBO_COOKIE", "SUB=expired")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            302,
+            headers={"location": "https://passport.weibo.com/sso/signin"},
+        )
+
+    real_client = httpx.AsyncClient
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(
+        weibo.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=transport, **kwargs),
+    )
+
+    with pytest.raises(RuntimeError, match="Cookie 已失效"):
+        await WeiboCrawler().get_trendings()

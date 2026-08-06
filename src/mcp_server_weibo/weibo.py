@@ -26,6 +26,10 @@ PASSPORT_HEADERS = {
 }
 
 
+class WeiboError(RuntimeError):
+    """A user-facing error returned by the Weibo API integration."""
+
+
 class WeiboCrawler:
     """
     A crawler class for extracting data from Weibo (Chinese social media platform).
@@ -41,6 +45,22 @@ class WeiboCrawler:
         self.logger = logging.getLogger(__name__)
         self.cookie_file = Path(cookie_file or os.environ.get(self.COOKIE_FILE_ENV, self.DEFAULT_COOKIE_FILE)).expanduser()
         self.cookies = self._load_cookies()
+
+    @staticmethod
+    def _response_json(response: httpx.Response) -> dict:
+        """Parse API JSON and turn login redirects into a clear error."""
+        location = response.headers.get("location", "")
+        if response.is_redirect or response.status_code in (401, 403) or "passport.weibo.com" in location:
+            raise WeiboError(
+                "微博 Cookie 已失效或未登录，请重新登录：`mcp-server-weibo login`"
+            )
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise WeiboError(
+                f"微博接口返回了非 JSON 响应（HTTP {response.status_code}），"
+                "可能是 Cookie 失效或触发风控，请重新登录后重试"
+            ) from exc
 
     @staticmethod
     def parse_cookie(cookie_header: str) -> dict[str, str]:
@@ -180,7 +200,7 @@ class WeiboCrawler:
                     params={**params, "qrid": qrid, "rid": "", "ver": "20250520"},
                 )
                 response.raise_for_status()
-                payload = response.json()
+                payload = self._response_json(response)
                 retcode = payload.get("retcode")
                 if retcode == 20000000:
                     data = payload.get("data", {})
@@ -234,7 +254,7 @@ class WeiboCrawler:
                     headers={**WEB_HEADERS, "X-Requested-With": "XMLHttpRequest"},
                 )
                 response.raise_for_status()
-                payload = response.json()
+                payload = self._response_json(response)
                 if payload.get("ok") != 1:
                     raise RuntimeError(payload.get("message") or payload.get("msg") or "Unable to fetch Weibo home timeline")
                 statuses = payload.get("statuses") or []
@@ -268,7 +288,7 @@ class WeiboCrawler:
                 headers={**WEB_HEADERS, "X-XSRF-TOKEN": xsrf},
             )
             response.raise_for_status()
-            data = response.json()
+            data = self._response_json(response)
             if data.get("ok") != 1:
                 raise RuntimeError(data.get("msg", f"Weibo friendship {action} failed"))
             return data
@@ -288,12 +308,12 @@ class WeiboCrawler:
         async with httpx.AsyncClient(cookies=self.cookies, trust_env=False) as client:
             try:
                 response=await client.get(PROFILE_URL.format(userId=uid), headers=DEFAULT_HEADERS)
-                result=response.json()
+                result=self._response_json(response)
                 return self._to_user_profile(result["data"]["userInfo"])
-            except httpx.HTTPError:
+            except httpx.HTTPError as exc:
                 self.logger.error(
                     f"Unable to extract profile for uid '{str(uid)}'", exc_info=True)
-                return {}
+                raise WeiboError(f"获取微博用户资料失败（uid={uid}）：{exc}") from exc
 
     async def get_feeds(self, uid: int, limit: int=15) -> list[FeedItem]:
         """
@@ -346,15 +366,15 @@ class WeiboCrawler:
                 encoded_params=urlencode(params)
 
                 response=await client.get(f'{SEARCH_URL}?{encoded_params}', headers=DEFAULT_HEADERS)
-                result=response.json()
+                result=self._response_json(response)
                 cards=list(
                     filter(lambda x: x['card_type'] == 9, result["data"]["cards"]))
                 feeds=[self._to_feed_item(item['mblog']) for item in cards]
                 return feeds[:limit]
-            except httpx.HTTPError:
+            except httpx.HTTPError as exc:
                 self.logger.error(
                     f"Unable to extract hot feeds for uid '{str(uid)}'", exc_info=True)
-                return []
+                raise WeiboError(f"获取微博热门微博失败（uid={uid}）：{exc}") from exc
 
     async def search_users(self, keyword: str, limit: int=5, page: int=1) -> list[UserProfile]:
         """
@@ -378,17 +398,17 @@ class WeiboCrawler:
                 encoded_params=urlencode(params)
 
                 response=await client.get(f'{SEARCH_URL}?{encoded_params}', headers=DEFAULT_HEADERS)
-                result=response.json()
+                result=self._response_json(response)
                 cards=result["data"]["cards"]
                 if len(cards) < 2:
                     return []
                 else:
                     cardGroup=cards[1]['card_group']
                     return [self._to_user_profile(item['user']) for item in cardGroup][:limit]
-            except httpx.HTTPError:
+            except httpx.HTTPError as exc:
                 self.logger.error(
                     f"Unable to search users for keyword '{keyword}'", exc_info=True)
-                return []
+                raise WeiboError(f"搜索微博用户失败（关键词={keyword}）：{exc}") from exc
 
     
     async def get_trendings(self, limit: int=15) -> list[TrendingItem]:
@@ -410,7 +430,7 @@ class WeiboCrawler:
             await self._ensure_cookies()
             async with httpx.AsyncClient(cookies=self.cookies, trust_env=False) as client:
                 response=await client.get(f'{SEARCH_URL}?{encoded_params}', headers=DEFAULT_HEADERS)
-                data=response.json()
+                data=self._response_json(response)
                 cards=data.get('data', {}).get('cards', [])
                 if not cards:
                     return []
@@ -425,10 +445,10 @@ class WeiboCrawler:
                 trending_items=list(map(lambda pair: self._to_trending_item(
                     {**pair[1], 'id': pair[0]}), enumerate(items[:limit])))
                 return trending_items
-        except httpx.HTTPError:
+        except httpx.HTTPError as exc:
             self.logger.error(
                 'Unable to fetch Weibo hot search list', exc_info=True)
-            return []
+            raise WeiboError(f"获取微博热搜失败：{exc}") from exc
 
     async def search_content(self, keyword: str, limit: int=15, page: int=1) -> list[FeedItem]:
         """
@@ -456,7 +476,7 @@ class WeiboCrawler:
 
                 async with httpx.AsyncClient(cookies=self.cookies, trust_env=False) as client:
                     response=await client.get(f'{SEARCH_URL}?{encoded_params}', headers=DEFAULT_HEADERS)
-                    data=response.json()
+                    data=self._response_json(response)
 
                 cards=data.get('data', {}).get('cards', [])
                 content_cards=[]
@@ -487,10 +507,10 @@ class WeiboCrawler:
                 if not cardlist_info.get('page') or str(cardlist_info.get('page')) == '1':
                     break
             return results[:limit]
-        except httpx.HTTPError:
+        except httpx.HTTPError as exc:
             self.logger.error(
                 f"Unable to search Weibo content for keyword '{keyword}'", exc_info=True)
-            return []
+            raise WeiboError(f"搜索微博内容失败（关键词={keyword}）：{exc}") from exc
 
     async def search_topics(self, keyword: str, limit: int=15, page: int=1) -> list[dict]:
         """
@@ -515,17 +535,17 @@ class WeiboCrawler:
                 encoded_params=urlencode(params)
 
                 response=await client.get(f'{SEARCH_URL}?{encoded_params}', headers=DEFAULT_HEADERS)
-                result=response.json()
+                result=self._response_json(response)
                 cards=result.get("data", {}).get("cards", [])
                 for card in cards:
                     card_group=card.get('card_group')
                     if card_group:
                         return [self._to_topic_item(item) for item in card_group][:limit]
                 return []
-            except (httpx.HTTPError, httpx.ConnectError, KeyError):
+            except (httpx.HTTPError, httpx.ConnectError, KeyError) as exc:
                 self.logger.error(
                     f"Unable to search topics for keyword '{keyword}'", exc_info=True)
-                return []
+                raise WeiboError(f"搜索微博话题失败（关键词={keyword}）：{exc}") from exc
 
     async def get_comments(self, feed_id: str, page: int=1) -> list[CommentItem]:
         """
@@ -543,13 +563,13 @@ class WeiboCrawler:
             async with httpx.AsyncClient(cookies=self.cookies, trust_env=False) as client:
                 url=COMMENTS_URL.format(feed_id=feed_id, page=page)
                 response=await client.get(url, headers=DEFAULT_HEADERS)
-                data=response.json()
+                data=self._response_json(response)
                 comments=data.get('data', {}).get('data', [])
                 return [self._to_comment_item(comment) for comment in comments]
-        except httpx.HTTPError:
+        except httpx.HTTPError as exc:
             self.logger.error(
                 f"Unable to fetch comments for feed_id '{feed_id}'", exc_info=True)
-            return []
+            raise WeiboError(f"获取微博评论失败（feed_id={feed_id}）：{exc}") from exc
 
     async def get_followers(self, uid: int, limit: int=15, page: int=1) -> list[UserProfile]:
         """
@@ -573,17 +593,17 @@ class WeiboCrawler:
                 encoded_params=urlencode(params)
 
                 response=await client.get(f'{SEARCH_URL}?{encoded_params}', headers=DEFAULT_HEADERS)
-                result=response.json()
+                result=self._response_json(response)
                 cards=result["data"]["cards"]
                 if len(cards) < 1:
                     return []
                 else:
                     cardGroup=cards[-1]['card_group']
                     return [self._to_user_profile(item['user']) for item in cardGroup][:limit]
-            except httpx.HTTPError:
+            except httpx.HTTPError as exc:
                 self.logger.error(
                     f"Unable to get followers for uid '{str(uid)}'", exc_info=True)
-                return []
+                raise WeiboError(f"获取微博粉丝失败（uid={uid}）：{exc}") from exc
 
     async def get_fans(self, uid: int, limit: int=15, page: int=1) -> list[UserProfile]:
         """
@@ -607,17 +627,17 @@ class WeiboCrawler:
                 encoded_params=urlencode(params)
 
                 response=await client.get(f'{SEARCH_URL}?{encoded_params}', headers=DEFAULT_HEADERS)
-                result=response.json()
+                result=self._response_json(response)
                 cards=result["data"]["cards"]
                 if len(cards) < 1:
                     return []
                 else:
                     cardGroup=cards[-1]['card_group']
                     return [self._to_user_profile(item['user']) for item in cardGroup][:limit]
-            except httpx.HTTPError:
+            except httpx.HTTPError as exc:
                 self.logger.error(
                     f"Unable to get fans for uid '{str(uid)}'", exc_info=True)
-                return []
+                raise WeiboError(f"获取微博关注失败（uid={uid}）：{exc}") from exc
 
     async def _get_container_id(self, client, uid: int):
         """
@@ -632,16 +652,16 @@ class WeiboCrawler:
         """
         try:
             response=await client.get(PROFILE_URL.format(userId=str(uid)), headers=DEFAULT_HEADERS)
-            data=response.json()
+            data=self._response_json(response)
             tabs_info=data.get("data", {}).get(
                 "tabsInfo", {}).get("tabs", [])
             for tab in tabs_info:
                 if tab.get("tabKey") == "weibo":
                     return tab.get("containerid")
-        except httpx.HTTPError:
+        except httpx.HTTPError as exc:
             self.logger.error(
                 f"Unable to extract containerId for uid '{str(uid)}'", exc_info=True)
-            return None
+            raise WeiboError(f"获取微博用户动态容器失败（uid={uid}）：{exc}") from exc
 
     async def _extract_feeds(self, client, uid: int, container_id: str, since_id: str):
         """
@@ -660,7 +680,7 @@ class WeiboCrawler:
             url=FEEDS_URL.format(userId=str(
                 uid), containerId=container_id, sinceId=since_id)
             response=await client.get(url, headers=DEFAULT_HEADERS)
-            data=response.json()
+            data=self._response_json(response)
 
             new_since_id=data.get("data", {}).get(
                 "cardlistInfo", {}).get("since_id", "")
@@ -670,10 +690,10 @@ class WeiboCrawler:
                 if mblog and (mblog.get('id') or mblog.get('idstr'))]
 
             return PagedFeeds(SinceId=new_since_id, Feeds=feeds)
-        except (httpx.HTTPError, httpx.ConnectError):
+        except (httpx.HTTPError, httpx.ConnectError) as exc:
             self.logger.error(
                 f"Unable to extract feeds for uid '{str(uid)}'", exc_info=True)
-            return PagedFeeds(SinceId="", Feeds=[])
+            raise WeiboError(f"获取微博动态失败（uid={uid}）：{exc}") from exc
 
     def _to_trending_item(self, item: dict) -> TrendingItem:
         """

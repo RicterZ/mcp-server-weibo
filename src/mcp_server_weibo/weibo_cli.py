@@ -16,6 +16,20 @@ def cli():
 
 
 @cli.command()
+@click.option('--timeout', default=240, show_default=True, help='QR login timeout in seconds')
+def login(timeout):
+    """Log in with a QR code and save the session cookies."""
+    async def run():
+        try:
+            session = await WeiboCrawler().qr_login(timeout)
+        except RuntimeError as exc:
+            raise click.ClickException(str(exc)) from exc
+        click.echo(f"登录成功，UID: {session.get('uid')}")
+
+    asyncio.run(run())
+
+
+@cli.command()
 @click.argument('uid', type=int)
 @click.option('--limit', '-n', default=15, help='Number of feeds to fetch')
 def feeds(uid, limit):
