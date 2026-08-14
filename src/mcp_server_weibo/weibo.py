@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
 
@@ -44,6 +45,8 @@ class WeiboCrawler:
     def __init__(self, cookie_file: str | Path | None = None):
         self.logger = logging.getLogger(__name__)
         self.cookie_file = Path(cookie_file or os.environ.get(self.COOKIE_FILE_ENV, self.DEFAULT_COOKIE_FILE)).expanduser()
+        self._uses_cookie_env = False
+        self._cookie_file_signature: tuple[int, int, int, int] | None = None
         self.cookies = self._load_cookies()
 
     @staticmethod
@@ -72,22 +75,87 @@ class WeiboCrawler:
         if cookie_header := os.environ.get(self.COOKIE_ENV):
             cookies = self.parse_cookie(cookie_header)
             if cookies:
+                self._uses_cookie_env = True
                 return cookies
-        if not self.cookie_file.exists():
+        signature = self._get_cookie_file_signature()
+        if signature is None:
             return None
         try:
             data = json.loads(self.cookie_file.read_text())
             cookies = data.get("cookies", data)
-            return cookies if isinstance(cookies, dict) and cookies else None
-        except (OSError, json.JSONDecodeError):
+            if not isinstance(cookies, dict):
+                raise ValueError("Cookie file must contain a JSON object")
+            if self._get_cookie_file_signature() == signature:
+                self._cookie_file_signature = signature
+            return cookies or None
+        except (OSError, json.JSONDecodeError, ValueError):
             self.logger.warning("Unable to load Weibo cookies from %s", self.cookie_file)
             return None
 
+    def _get_cookie_file_signature(self) -> tuple[int, int, int, int] | None:
+        try:
+            stat = self.cookie_file.stat()
+            return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            self.logger.warning("Unable to stat Weibo cookies at %s", self.cookie_file)
+            return None
+
+    def _reload_cookies_if_changed(self) -> None:
+        """Reload file-backed cookies after another process updates them."""
+        if self._uses_cookie_env:
+            return
+
+        signature = self._get_cookie_file_signature()
+        if signature == self._cookie_file_signature:
+            return
+        if signature is None:
+            if self._cookie_file_signature is not None:
+                self.cookies = None
+                self._cookie_file_signature = None
+            return
+
+        try:
+            data = json.loads(self.cookie_file.read_text())
+            cookies = data.get("cookies", data)
+            if not isinstance(cookies, dict):
+                raise ValueError("Cookie file must contain a JSON object")
+        except (OSError, json.JSONDecodeError, ValueError):
+            self.logger.warning(
+                "Unable to reload Weibo cookies from %s; keeping the current session",
+                self.cookie_file,
+            )
+            return
+
+        # If the file changed while it was being read, retry on the next request.
+        if self._get_cookie_file_signature() != signature:
+            return
+        self.cookies = cookies or None
+        self._cookie_file_signature = signature
+
     def save_cookies(self, cookies: dict[str, str]) -> None:
         self.cookie_file.parent.mkdir(parents=True, exist_ok=True)
-        self.cookie_file.write_text(json.dumps({"cookies": cookies}, ensure_ascii=False))
-        self.cookie_file.chmod(0o600)
+        content = json.dumps({"cookies": cookies}, ensure_ascii=False)
+        fd, temporary_path = tempfile.mkstemp(
+            dir=self.cookie_file.parent,
+            prefix=f".{self.cookie_file.name}.",
+        )
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as file:
+                fd = -1
+                file.write(content)
+            os.replace(temporary_path, self.cookie_file)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
         self.cookies = cookies
+        self._cookie_file_signature = self._get_cookie_file_signature()
 
     async def _validate_cookies(self, cookies: dict) -> bool:
         try:
@@ -102,6 +170,7 @@ class WeiboCrawler:
             return False
 
     async def _ensure_cookies(self, retry: bool = False) -> dict:
+        self._reload_cookies_if_changed()
         if self.cookies:
             return self.cookies
         try:
@@ -139,6 +208,7 @@ class WeiboCrawler:
 
     async def get_session(self) -> dict:
         """Return the current real-user login state without exposing cookies."""
+        self._reload_cookies_if_changed()
         if not self.cookies:
             return {"login": False, "uid": None}
         try:

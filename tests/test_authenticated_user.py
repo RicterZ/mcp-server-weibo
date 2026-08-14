@@ -24,6 +24,50 @@ async def test_cookie_precedence_persistence_and_no_visitor_overwrite(tmp_path, 
 
 
 @pytest.mark.asyncio
+async def test_file_cookies_reload_after_external_login(tmp_path, monkeypatch):
+    monkeypatch.delenv("WEIBO_COOKIE", raising=False)
+    cookie_file = tmp_path / "cookies.json"
+    cookie_file.write_text(json.dumps({"cookies": {"SUB": "old-session"}}))
+    crawler = WeiboCrawler(cookie_file)
+
+    # Simulate weibo-cli login writing to the volume from another process.
+    WeiboCrawler(cookie_file).save_cookies(
+        {"SUB": "new-session", "XSRF-TOKEN": "fresh-csrf"}
+    )
+
+    monkeypatch.setattr(weibo.httpx, "AsyncClient", lambda **kwargs: pytest.fail("network was used"))
+    assert await crawler._ensure_cookies() == {
+        "SUB": "new-session",
+        "XSRF-TOKEN": "fresh-csrf",
+    }
+
+
+@pytest.mark.asyncio
+async def test_session_check_uses_reloaded_file_cookies(tmp_path, monkeypatch):
+    monkeypatch.delenv("WEIBO_COOKIE", raising=False)
+    cookie_file = tmp_path / "cookies.json"
+    cookie_file.write_text(json.dumps({"cookies": {"SUB": "old-session"}}))
+    crawler = WeiboCrawler(cookie_file)
+    WeiboCrawler(cookie_file).save_cookies({"SUB": "new-session"})
+    cookie_headers = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        cookie_headers.append(request.headers.get("cookie"))
+        return httpx.Response(200, json={"data": {"login": True, "uid": "123"}})
+
+    real_client = httpx.AsyncClient
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(
+        weibo.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=transport, **kwargs),
+    )
+
+    assert await crawler.get_session() == {"login": True, "uid": "123"}
+    assert cookie_headers == ["SUB=new-session"]
+
+
+@pytest.mark.asyncio
 async def test_home_timeline_and_friendship_requests(tmp_path, monkeypatch):
     monkeypatch.setenv("WEIBO_COOKIE", "SUB=user; XSRF-TOKEN=csrf-token")
     requests = []

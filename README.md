@@ -60,6 +60,11 @@ docker run -d --name weibo -p 4200:4200 \
   mcp-server-weibo
 ```
 
+服务运行期间也可以再次使用同一个卷执行登录。Cookie 更新后会在下一次 MCP 请求时自动加载，无需重启服务容器：
+```bash
+docker run --rm -it -v weibo-data:/data mcp-server-weibo login
+```
+
 MCP 客户端配置（HTTP 模式）：
 ```json
 {
