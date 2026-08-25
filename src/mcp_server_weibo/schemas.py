@@ -33,13 +33,8 @@ class FeedItem(CompactModel):
 
     id: int = Field()
     text: str = Field()
-    source: str = Field(default="")
     created_at: str = Field(default="")
     user: Union[UserRef, None] = Field(default=None)
-    comments_count: int = Field(default=0)
-    attitudes_count: int = Field(default=0)
-    reposts_count: int = Field(default=0)
-    region_name: str = Field(default="")
     pics: list[str] = Field(default_factory=list)
     video_url: str = Field(default="")
 

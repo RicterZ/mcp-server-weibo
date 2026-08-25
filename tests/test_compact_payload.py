@@ -37,14 +37,20 @@ def test_feed_dump_drops_heavy_fields():
     })
 
     dumped = feed.model_dump()
-    assert dumped["user"] == {"id": 2, "screen_name": "用户", "verified": True}
-    assert dumped["pics"] == ["https://example/large.jpg"]
-    assert dumped["video_url"] == "https://video.weibo.com/show?fid=1"
-    assert "raw_text" not in dumped
-    assert "videos" not in dumped
+    assert dumped == {
+        "id": 1,
+        "text": "正文",
+        "created_at": "刚刚",
+        "user": {"id": 2, "screen_name": "用户", "verified": True},
+        "pics": ["https://example/large.jpg"],
+        "video_url": "https://video.weibo.com/show?fid=1",
+    }
+    assert "source" not in dumped
+    assert "comments_count" not in dumped
+    assert "attitudes_count" not in dumped
+    assert "reposts_count" not in dumped
     assert "region_name" not in dumped
-    assert "profile_image_url" not in dumped["user"]
-    assert "followers_count" not in dumped["user"]
+    assert "raw_text" not in dumped
 
 
 def test_profile_keeps_subject_fields_only():

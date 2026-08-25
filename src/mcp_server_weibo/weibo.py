@@ -804,13 +804,8 @@ class WeiboCrawler:
         return FeedItem(
             id=mblog.get('id') or mblog.get('idstr'),
             text=html_to_text(mblog.get('text') or mblog.get('text_raw', '')),
-            source=mblog.get('source', ''),
             created_at=mblog.get('created_at', ''),
             user=user,
-            comments_count=mblog.get('comments_count', 0),
-            attitudes_count=mblog.get('attitudes_count', 0),
-            reposts_count=mblog.get('reposts_count', 0),
-            region_name=mblog.get('region_name', ''),
             pics=pics,
             video_url=video_url,
         )
