@@ -12,6 +12,7 @@ import httpx
 import qrcode
 
 from mcp_server_weibo.consts import DEFAULT_HEADERS, PROFILE_URL, FEEDS_URL, SEARCH_URL, COMMENTS_URL
+from mcp_server_weibo.html_text import html_to_text
 from mcp_server_weibo.schemas import PagedFeeds, TrendingItem, FeedItem, UserProfile, CommentItem
 
 
@@ -825,7 +826,7 @@ class WeiboCrawler:
             mblog.get('user', {})) if mblog.get('user') else {}
         return FeedItem(
             id=mblog.get('id') or mblog.get('idstr'),
-            text=mblog.get('text') or mblog.get('text_raw', ''),
+            text=html_to_text(mblog.get('text') or mblog.get('text_raw', '')),
             source=mblog.get('source', ''),
             created_at=mblog.get('created_at', ''),
             user=user,
@@ -891,10 +892,10 @@ class WeiboCrawler:
         """
         return CommentItem(
             id=item.get('id'),
-            text=item.get('text'),
+            text=html_to_text(item.get('text')),
             created_at=item.get('created_at'),
             user=self._to_user_profile(item.get('user', {})),
             source=item.get('source', ''),
             reply_id=item.get('reply_id', None),
-            reply_text=item.get('reply_text', ''),
+            reply_text=html_to_text(item.get('reply_text', '')),
         )
