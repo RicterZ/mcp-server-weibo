@@ -113,6 +113,8 @@ def test_feed_and_comment_converters_use_filter():
         "user": {"id": 2, "screen_name": "用户"},
     })
     assert feed.text == "第一行\n第二行 ..."
+    assert feed.user.screen_name == "用户"
+    assert "profile_image_url" not in feed.model_dump()["user"]
 
     comment = crawler._to_comment_item({
         "id": 3,

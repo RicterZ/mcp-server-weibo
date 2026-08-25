@@ -13,7 +13,7 @@ import qrcode
 
 from mcp_server_weibo.consts import DEFAULT_HEADERS, PROFILE_URL, FEEDS_URL, SEARCH_URL, COMMENTS_URL
 from mcp_server_weibo.html_text import html_to_text
-from mcp_server_weibo.schemas import PagedFeeds, TrendingItem, FeedItem, UserProfile, CommentItem
+from mcp_server_weibo.schemas import PagedFeeds, TrendingItem, FeedItem, UserProfile, UserRef, CommentItem
 
 
 WEB_HEADERS = {
@@ -782,7 +782,6 @@ class WeiboCrawler:
             id=item['id'],
             trending=trending,
             description=item['desc'],
-            url=item.get('scheme', '')
         )
 
     def _to_feed_item(self, mblog: dict) -> FeedItem:
@@ -795,35 +794,13 @@ class WeiboCrawler:
         Returns:
             FeedItem: Formatted feed item information
         """
-        pics=[pic for pic in mblog.get(
-            'pics', []) if 'url' in pic] if mblog.get('pics') else []
-        pics=[{'thumbnail': pic['url'], 'large': pic['large']['url']}
-            for pic in pics] if pics else []
-        if not pics and mblog.get('pic_infos'):
-            pics = [
-                {
-                    'thumbnail': info.get('thumbnail', {}).get('url', ''),
-                    'large': info.get('largest', info.get('large', {})).get('url', ''),
-                }
-                for info in mblog['pic_infos'].values()
-            ]
+        pics=self._to_pic_urls(mblog)
+        page_info=mblog.get('page_info') or {}
+        video_url=''
+        if page_info.get('type') == 'video':
+            video_url=page_info.get('page_url') or page_info.get('url_ori') or ''
 
-        videos={}
-        page_info=mblog.get('page_info')
-        if page_info and page_info.get('type') == 'video':
-            if 'media_info' in page_info:
-                videos['stream_url']=page_info['media_info'].get(
-                    'stream_url', '')
-                videos['stream_url_hd']=page_info['media_info'].get(
-                    'stream_url_hd', '')
-            elif 'urls' in page_info:
-                videos['mp4_720p_mp4']=page_info['urls'].get(
-                    'mp4_720p_mp4', '')
-                videos['mp4_hd_mp4']=page_info['urls'].get('mp4_hd_mp4', '')
-                videos['mp4_ld_mp4']=page_info['urls'].get('mp4_ld_mp4', '')
-
-        user=self._to_user_profile(
-            mblog.get('user', {})) if mblog.get('user') else {}
+        user=self._to_user_ref(mblog['user']) if mblog.get('user') else None
         return FeedItem(
             id=mblog.get('id') or mblog.get('idstr'),
             text=html_to_text(mblog.get('text') or mblog.get('text_raw', '')),
@@ -833,10 +810,9 @@ class WeiboCrawler:
             comments_count=mblog.get('comments_count', 0),
             attitudes_count=mblog.get('attitudes_count', 0),
             reposts_count=mblog.get('reposts_count', 0),
-            raw_text=mblog.get('raw_text', ''),
             region_name=mblog.get('region_name', ''),
             pics=pics,
-            videos=videos if videos else {}
+            video_url=video_url,
         )
 
     def _to_user_profile(self, user: dict) -> UserProfile:
@@ -852,16 +828,33 @@ class WeiboCrawler:
         return UserProfile(
             id=user['id'],
             screen_name=user.get('screen_name', ''),
-            profile_image_url=user.get('profile_image_url', user.get('avatar_large', '')),
-            profile_url=user.get('profile_url', f"/u/{user['id']}"),
             description=user.get('description', ''),
-            follow_count=user.get('follow_count', 0),
-            followers_count=user.get('followers_count', ''),
-            avatar_hd=user.get('avatar_hd', ''),
-            verified=user.get('verified', False),
-            verified_reason=user.get('verified_reason', ''),
-            gender=user.get('gender', '')
+            followers_count=str(user.get('followers_count') or ''),
+            verified=bool(user.get('verified', False)),
         )
+
+    def _to_user_ref(self, user: dict) -> UserRef:
+        return UserRef(
+            id=user['id'],
+            screen_name=user.get('screen_name', ''),
+            verified=bool(user.get('verified', False)),
+        )
+
+    @staticmethod
+    def _to_pic_urls(mblog: dict) -> list[str]:
+        urls=[]
+        for pic in mblog.get('pics') or []:
+            if isinstance(pic.get('large'), dict) and pic['large'].get('url'):
+                urls.append(pic['large']['url'])
+            elif pic.get('url'):
+                urls.append(pic['url'])
+        if urls:
+            return urls
+        for info in (mblog.get('pic_infos') or {}).values():
+            url=(info.get('largest') or info.get('large') or {}).get('url')
+            if url:
+                urls.append(url)
+        return urls
 
     def _to_topic_item(self, item: dict) -> dict:
         """
@@ -890,11 +883,12 @@ class WeiboCrawler:
         Returns:
             CommentItem: Formatted comment information
         """
+        user=item.get('user')
         return CommentItem(
             id=item.get('id'),
             text=html_to_text(item.get('text')),
-            created_at=item.get('created_at'),
-            user=self._to_user_profile(item.get('user', {})),
+            created_at=item.get('created_at') or '',
+            user=self._to_user_ref(user) if user else None,
             source=item.get('source', ''),
             reply_id=item.get('reply_id', None),
             reply_text=html_to_text(item.get('reply_text', '')),
