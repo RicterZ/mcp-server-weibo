@@ -37,6 +37,9 @@ class FeedItem(CompactModel):
     user: Union[UserRef, None] = Field(default=None)
     pics: list[str] = Field(default_factory=list)
     video_url: str = Field(default="")
+    text_truncated: Union[bool, None] = Field(
+        default=None, description="True when the full post could not be retrieved."
+    )
 
 
 class PagedFeeds(BaseModel):

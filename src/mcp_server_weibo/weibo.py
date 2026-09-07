@@ -330,8 +330,10 @@ class WeiboCrawler:
                     raise RuntimeError(payload.get("message") or payload.get("msg") or "Unable to fetch Weibo home timeline")
                 statuses = payload.get("statuses") or []
                 if current_page == max(page, 1):
-                    return [self._to_feed_item(status) for status in statuses[:limit]
-                        if status.get("id") or status.get("idstr")]
+                    return await self._to_feed_items(client, [
+                        status for status in statuses[:limit]
+                        if status.get("id") or status.get("idstr")
+                    ])
                 max_id = str(payload.get("max_id_str") or payload.get("max_id") or "0")
                 if not statuses or max_id == "0":
                     return []
@@ -440,8 +442,9 @@ class WeiboCrawler:
                 result=self._response_json(response)
                 cards=list(
                     filter(lambda x: x['card_type'] == 9, result["data"]["cards"]))
-                feeds=[self._to_feed_item(item['mblog']) for item in cards]
-                return feeds[:limit]
+                return await self._to_feed_items(
+                    client, [item['mblog'] for item in cards[:limit]]
+                )
             except httpx.HTTPError as exc:
                 self.logger.error(
                     f"Unable to extract hot feeds for uid '{str(uid)}'", exc_info=True)
@@ -549,29 +552,21 @@ class WeiboCrawler:
                     response=await client.get(f'{SEARCH_URL}?{encoded_params}', headers=DEFAULT_HEADERS)
                     data=self._response_json(response)
 
-                cards=data.get('data', {}).get('cards', [])
-                content_cards=[]
-                for card in cards:
-                    if card.get('card_type') == 9:
-                        content_cards.append(card)
-                    elif 'card_group' in card and isinstance(card['card_group'], list):
-                        content_group=[
-                            item for item in card['card_group'] if item.get('card_type') == 9]
-                        content_cards.extend(content_group)
+                    cards=data.get('data', {}).get('cards', [])
+                    content_cards=[]
+                    for card in cards:
+                        if card.get('card_type') == 9:
+                            content_cards.append(card)
+                        elif 'card_group' in card and isinstance(card['card_group'], list):
+                            content_group=[
+                                item for item in card['card_group'] if item.get('card_type') == 9]
+                            content_cards.extend(content_group)
 
-                if not content_cards:
-                    break
-
-                for card in content_cards:
-                    if len(results) >= limit:
+                    if not content_cards:
                         break
 
-                    mblog=card.get('mblog')
-                    if not mblog:
-                        continue
-
-                    content_result=self._to_feed_item(mblog)
-                    results.append(content_result)
+                    mblogs = [card['mblog'] for card in content_cards if card.get('mblog')]
+                    results.extend(await self._to_feed_items(client, mblogs[:limit - len(results)]))
 
                 current_page += 1
                 cardlist_info=data.get('data', {}).get('cardlistInfo', {})
@@ -757,8 +752,8 @@ class WeiboCrawler:
                 "cardlistInfo", {}).get("since_id", "")
             cards=data.get("data", {}).get("cards", [])
             mblogs = [card.get('mblog') for card in cards]
-            feeds = [self._to_feed_item(mblog) for mblog in mblogs
-                if mblog and (mblog.get('id') or mblog.get('idstr'))]
+            feeds = await self._to_feed_items(client, [mblog for mblog in mblogs
+                if mblog and (mblog.get('id') or mblog.get('idstr'))])
 
             return PagedFeeds(SinceId=new_since_id, Feeds=feeds)
         except (httpx.HTTPError, httpx.ConnectError) as exc:
@@ -783,6 +778,60 @@ class WeiboCrawler:
             trending=trending,
             description=item['desc'],
         )
+
+    async def _to_feed_items(self, client: httpx.AsyncClient, mblogs: list[dict]) -> list[FeedItem]:
+        """Expand long posts with bounded concurrency, preserving result order."""
+        semaphore = asyncio.Semaphore(4)
+
+        async def convert(mblog: dict) -> FeedItem:
+            async with semaphore:
+                return await self._expand_feed(client, mblog)
+
+        return list(await asyncio.gather(*(convert(mblog) for mblog in mblogs)))
+
+    async def _expand_feed(self, client: httpx.AsyncClient, mblog: dict) -> FeedItem:
+        feed = self._to_feed_item(mblog)
+        embedded = mblog.get('longText') or {}
+        full_text = embedded.get('longTextContent') if isinstance(embedded, dict) else None
+        if isinstance(full_text, str) and full_text.strip():
+            feed.text = html_to_text(full_text)
+            return feed
+
+        text = mblog.get('text') or ''
+        if not (mblog.get('isLongText') or re.search(r'>\s*(?:全文|展开)\s*</(?:a|span)>', text)):
+            return feed
+
+        feed.text_truncated = True
+        # Mobile HTML preserves the same topic/link labels as search results.
+        # The desktop endpoint is a fallback when mobile expansion is unavailable.
+        for url, headers in (
+            ('https://m.weibo.cn/statuses/extend', DEFAULT_HEADERS),
+            ('https://weibo.com/ajax/statuses/longtext', WEB_HEADERS),
+        ):
+            try:
+                response = await client.get(url, params={'id': str(feed.id)}, headers=headers, timeout=10)
+                response.raise_for_status()
+                payload = self._response_json(response)
+                if not isinstance(payload, dict) or payload.get('ok') != 1:
+                    continue
+                data = payload.get('data')
+                if not isinstance(data, dict) or data.get('ok', 1) != 1:
+                    continue
+                raw_text = data.get('longTextContent_raw')
+                full_text = data.get('longTextContent')
+                if isinstance(raw_text, str) and raw_text.strip():
+                    feed.text = raw_text
+                elif isinstance(full_text, str) and full_text.strip():
+                    feed.text = html_to_text(full_text)
+                else:
+                    continue
+                feed.text_truncated = None
+                return feed
+            except (httpx.HTTPError, WeiboError):
+                continue
+
+        self.logger.warning('Unable to expand Weibo post %s; returning marked excerpt', feed.id)
+        return feed
 
     def _to_feed_item(self, mblog: dict) -> FeedItem:
         """
