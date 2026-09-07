@@ -4,7 +4,7 @@ Unit tests for server.py
 import pytest
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -135,6 +135,77 @@ class TestServerTools:
         crawler2 = get_crawler()
 
         assert crawler1 is crawler2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "name, arguments, payload, structured",
+    [
+        ("search_content", {"keyword": "蔚蓝档案", "limit": 1},
+         [{"id": 123, "text": "正文\n第二行"}],
+         {"result": [{"id": 123, "text": "正文\n第二行"}]}),
+        ("search_content", {"keyword": "没有结果"}, [], {"result": []}),
+        ("get_profile", {"uid": 123},
+         {"id": 123, "screen_name": "用户"}, {"id": 123, "screen_name": "用户"}),
+        ("get_profile", {"uid": 123}, {}, {}),
+    ],
+)
+async def test_successful_tool_results_only_contain_structured_data(
+    monkeypatch, name, arguments, payload, structured,
+):
+    from fastmcp import Client
+    from jsonschema import validate
+    from mcp_server_weibo import server
+
+    crawler = AsyncMock()
+    getattr(crawler, name).return_value = payload
+    monkeypatch.setattr(server, "_crawler", crawler)
+
+    async with Client(server.mcp) as client:
+        schema = next(t.outputSchema for t in await client.list_tools() if t.name == name)
+        result = await client.call_tool(name, arguments)
+
+    assert result.is_error is False
+    assert result.content == []
+    assert result.structured_content == structured
+    validate(result.structured_content, schema)
+
+
+@pytest.mark.asyncio
+async def test_tool_errors_keep_readable_content(monkeypatch):
+    from fastmcp import Client
+    from mcp_server_weibo import server
+
+    crawler = AsyncMock()
+    crawler.search_content.side_effect = RuntimeError("Weibo unavailable")
+    monkeypatch.setattr(server, "_crawler", crawler)
+
+    async with Client(server.mcp) as client:
+        result = await client.call_tool(
+            "search_content", {"keyword": "测试"}, raise_on_error=False,
+        )
+
+    assert result.is_error is True
+    assert result.structured_content is None
+    assert any("Weibo unavailable" in block.text for block in result.content)
+
+
+@pytest.mark.asyncio
+async def test_text_only_results_keep_content():
+    from fastmcp import Client, FastMCP
+    from mcp_server_weibo.server import StructuredContentOnly
+
+    app = FastMCP("text-result-test", middleware=[StructuredContentOnly()])
+
+    @app.tool(output_schema=None)
+    def status() -> str:
+        return "ready"
+
+    async with Client(app) as client:
+        result = await client.call_tool("status", {})
+
+    assert result.structured_content is None
+    assert result.content[0].text == "ready"
 
 
 class TestCookieEnvFile:

@@ -1,4 +1,7 @@
 from fastmcp import FastMCP, Context
+from fastmcp.server.middleware import Middleware, MiddlewareContext, CallNext
+from fastmcp.tools.tool import ToolResult
+from mcp.types import CallToolRequestParams
 from .weibo import WeiboCrawler
 from typing import Annotated
 from pydantic import Field
@@ -6,8 +9,23 @@ import argparse
 import asyncio
 import os
 
-# Initialize FastMCP server with name "Weibo"
-mcp = FastMCP("Weibo")
+class StructuredContentOnly(Middleware):
+    """Avoid duplicating structured tool data in JSON text blocks."""
+
+    async def on_call_tool(
+        self,
+        context: MiddlewareContext[CallToolRequestParams],
+        call_next: CallNext[CallToolRequestParams, ToolResult],
+    ) -> ToolResult:
+        result = await call_next(context)
+        if result.structured_content is not None:
+            # Keep MCP's required content field, but omit the redundant payload.
+            result.content = []
+        return result
+
+
+# Clients must read structuredContent for successful data results.
+mcp = FastMCP("Weibo", middleware=[StructuredContentOnly()])
 
 # Global crawler instance (initialized in main to handle cookie config first)
 _crawler = None
