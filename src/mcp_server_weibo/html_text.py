@@ -60,7 +60,7 @@ class _WeiboHTMLToText(HTMLParser):
 def html_to_text(value: str | None) -> str:
     """Extract plain text from a Weibo HTML snippet.
 
-    Already-plain strings are returned unchanged. ``<br>`` becomes a newline,
+    Zero-width spaces (U+200B) are removed. ``<br>`` becomes a newline,
     emoji ``<img alt>`` keeps the alt label, topic/mention/link inner text is
     preserved, and ``全文`` expand links are dropped.
     """
@@ -69,12 +69,12 @@ def html_to_text(value: str | None) -> str:
     if not isinstance(value, str):
         value = str(value)
     if not value or not _HTML_TAG.search(value):
-        return value
+        return value.replace("\u200b", "")
 
     parser = _WeiboHTMLToText()
     parser.feed(value)
     parser.close()
-    return _normalize_text("".join(parser.parts))
+    return _normalize_text("".join(parser.parts).replace("\u200b", ""))
 
 
 def _normalize_text(text: str) -> str:

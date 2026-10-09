@@ -8,6 +8,14 @@ def test_plain_text_is_unchanged():
     assert html_to_text(None) == ""
 
 
+def test_zero_width_spaces_are_removed():
+    assert html_to_text("\u200b微\u200b博\u200b") == "微博"
+    assert html_to_text("\u200b\u200b") == ""
+    assert html_to_text("<p>微&#8203;博&#x200b;\u200b</p>") == "微博"
+    assert html_to_text("<p>&#8203;</p><p>正文</p>") == "正文"
+    assert html_to_text("👩\u200d💻") == "👩\u200d💻"
+
+
 def test_br_and_expand_link_from_live_feed():
     raw = (
         "小米澎程技术发布会，发布小米昆仑技术架构与两款智能可变大空间SUV。"
@@ -101,7 +109,7 @@ def test_dump_search_content_and_home_timeline_html():
     assert html_to_text(desktop) == (
         "#蔚蓝档案# 蔚蓝档案超话\n"
         "【百花缭乱篇】第2章Part2（16~28话）即将更新！"
-        "第21话《 ​​​ ..."
+        "第21话《  ..."
     )
 
 
