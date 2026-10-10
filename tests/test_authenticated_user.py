@@ -206,3 +206,94 @@ async def test_expired_cookie_returns_clear_error(monkeypatch):
 
     with pytest.raises(RuntimeError, match="Cookie 已失效"):
         await WeiboCrawler().get_trendings()
+
+
+@pytest.mark.asyncio
+async def test_rotated_cookie_is_saved_and_reused(tmp_path, monkeypatch):
+    monkeypatch.delenv("WEIBO_COOKIE", raising=False)
+    crawler = WeiboCrawler(tmp_path / "cookies.json")
+    crawler.save_cookies({"SUB": "old"})
+    headers = []
+
+    def handler(request):
+        headers.append(request.headers.get("cookie"))
+        return httpx.Response(200, headers={"set-cookie": "SUB=new; Path=/"})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(weibo.httpx, "AsyncClient", lambda **kw: real_client(
+        transport=httpx.MockTransport(handler), **kw))
+    async with crawler._session_client() as client:
+        await client.get("https://weibo.com/first")
+        await client.get("https://weibo.com/second")
+    async with crawler._session_client() as client:
+        await client.get("https://weibo.com/third")
+    assert headers == ["SUB=old", "SUB=new", "SUB=new"]
+    assert WeiboCrawler(crawler.cookie_file).cookies == {"SUB": "new"}
+
+
+@pytest.mark.asyncio
+async def test_inflight_response_does_not_overwrite_new_login(tmp_path, monkeypatch):
+    monkeypatch.delenv("WEIBO_COOKIE", raising=False)
+    crawler = WeiboCrawler(tmp_path / "cookies.json")
+    crawler.save_cookies({"SUB": "old"})
+
+    def handler(request):
+        WeiboCrawler(crawler.cookie_file).save_cookies({"SUB": "new-login"})
+        return httpx.Response(200, headers={"set-cookie": "SUB=stale; Path=/"})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(weibo.httpx, "AsyncClient", lambda **kw: real_client(
+        transport=httpx.MockTransport(handler), **kw))
+    async with crawler._session_client() as client:
+        await client.get("https://weibo.com/")
+    assert await crawler._ensure_cookies() == {"SUB": "new-login"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["timeout", "403", "503", "html", "missing-login"])
+async def test_session_errors_are_not_reported_as_logged_out(tmp_path, monkeypatch, failure):
+    monkeypatch.setenv("WEIBO_COOKIE", "SUB=user")
+
+    def handler(request):
+        if failure == "timeout":
+            raise httpx.ReadTimeout("timeout", request=request)
+        if failure.isdigit():
+            return httpx.Response(int(failure))
+        if failure == "html":
+            return httpx.Response(200, text="<html>challenge</html>")
+        return httpx.Response(200, json={"data": {}})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(weibo.httpx, "AsyncClient", lambda **kw: real_client(
+        transport=httpx.MockTransport(handler), **kw))
+    crawler = WeiboCrawler(tmp_path / "cookies.json")
+    with pytest.raises(weibo.WeiboError):
+        await crawler.get_session()
+    assert crawler.cookies == {"SUB": "user"}
+
+
+@pytest.mark.asyncio
+async def test_explicit_logged_out_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("WEIBO_COOKIE", "SUB=expired")
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(weibo.httpx, "AsyncClient", lambda **kw: real_client(
+        transport=httpx.MockTransport(lambda request: httpx.Response(
+            200, json={"data": {"login": False}})), **kw))
+    assert await WeiboCrawler(tmp_path / "cookies.json").get_session() == {
+        "login": False, "uid": None,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expiry", ["Max-Age=0", "Expires=Thu, 01 Jan 1970 00:00:00 GMT"])
+async def test_cookie_deletion_is_saved(tmp_path, monkeypatch, expiry):
+    monkeypatch.delenv("WEIBO_COOKIE", raising=False)
+    crawler = WeiboCrawler(tmp_path / "cookies.json")
+    crawler.save_cookies({"SUB": "user", "obsolete": "value"})
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(weibo.httpx, "AsyncClient", lambda **kw: real_client(
+        transport=httpx.MockTransport(lambda request: httpx.Response(
+            200, headers={"set-cookie": f"obsolete=; Path=/; {expiry}"})), **kw))
+    async with crawler._session_client() as client:
+        await client.get("https://weibo.com/")
+    assert WeiboCrawler(crawler.cookie_file).cookies == {"SUB": "user"}

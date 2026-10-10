@@ -1,4 +1,7 @@
 import asyncio
+from contextlib import asynccontextmanager
+from email.utils import parsedate_to_datetime
+import time
 from http.cookies import SimpleCookie
 import json
 import logging
@@ -54,10 +57,16 @@ class WeiboCrawler:
     def _response_json(response: httpx.Response) -> dict:
         """Parse API JSON and turn login redirects into a clear error."""
         location = response.headers.get("location", "")
-        if response.is_redirect or response.status_code in (401, 403) or "passport.weibo.com" in location:
+        if response.status_code == 401 or (
+            response.is_redirect and urlparse(location).hostname in
+            {"passport.weibo.com", "passport.weibo.cn", "login.sina.com.cn"}
+        ):
             raise WeiboError(
                 "微博 Cookie 已失效或未登录，请重新登录：`mcp-server-weibo login`"
             )
+        if response.is_redirect or response.status_code == 403:
+            raise WeiboError("微博接口拒绝访问或发生跳转，无法据此判断登录已失效")
+        response.raise_for_status()
         try:
             return response.json()
         except ValueError as exc:
@@ -158,12 +167,71 @@ class WeiboCrawler:
         self.cookies = cookies
         self._cookie_file_signature = self._get_cookie_file_signature()
 
+    @asynccontextmanager
+    async def _session_client(self, **kwargs):
+        # Merge only response changes; an older request must not replace a newer login.
+        original = dict(self.cookies or {})
+        signature = self._cookie_file_signature
+
+        async def remember_cookies(response):
+            nonlocal signature
+            host = response.url.host
+            if not any(host == domain or host.endswith("." + domain)
+                       for domain in ("weibo.com", "weibo.cn", "sina.com.cn")):
+                return
+            if not self._uses_cookie_env and self._get_cookie_file_signature() != signature:
+                return
+            updated = dict(self.cookies or {})
+            changes = {cookie.name: cookie.value for cookie in response.cookies.jar}
+            # CookieJar omits expired cookies, so handle explicit deletions separately.
+            for header in response.headers.get_list("set-cookie"):
+                parsed = SimpleCookie()
+                parsed.load(header)
+                for name, morsel in parsed.items():
+                    domain = morsel["domain"].lstrip(".")
+                    if domain and host != domain and not host.endswith("." + domain):
+                        continue
+                    try:
+                        expired = (int(morsel["max-age"]) <= 0 if morsel["max-age"] else
+                                   bool(morsel["expires"]) and
+                                   parsedate_to_datetime(morsel["expires"]).timestamp() <= time.time())
+                    except (ValueError, TypeError, OverflowError):
+                        continue
+                    if expired:
+                        changes[name] = None
+            for name, value in changes.items():
+                if updated.get(name) != original.get(name):
+                    continue
+                if value is None:
+                    updated.pop(name, None)
+                else:
+                    updated[name] = value
+                # Imported cookies have no domain; avoid sending both old and new values.
+                for existing in list(client.cookies.jar):
+                    if existing.name == name and not existing.domain:
+                        client.cookies.jar.clear(existing.domain, existing.path, existing.name)
+            if updated != self.cookies:
+                if self._uses_cookie_env or signature is None:
+                    self.cookies = updated
+                else:
+                    self.save_cookies(updated)
+                    signature = self._cookie_file_signature
+                original.clear()
+                original.update(updated)
+
+        async with httpx.AsyncClient(
+            cookies=self.cookies, trust_env=False,
+            event_hooks={"response": [remember_cookies]}, **kwargs,
+        ) as client:
+            yield client
+
     async def _validate_cookies(self, cookies: dict) -> bool:
         try:
             async with httpx.AsyncClient(cookies=cookies, follow_redirects=True, trust_env=False) as client:
                 response = await client.get("https://m.weibo.cn/api/config", headers=DEFAULT_HEADERS)
                 response.raise_for_status()
                 data = response.json().get("data", {})
+                cookies.update({cookie.name: cookie.value for cookie in client.cookies.jar})
                 if data.get("st"):
                     cookies["XSRF-TOKEN"] = data["st"]
                 return bool(data.get("login") and data.get("uid"))
@@ -213,15 +281,19 @@ class WeiboCrawler:
         if not self.cookies:
             return {"login": False, "uid": None}
         try:
-            async with httpx.AsyncClient(cookies=self.cookies, follow_redirects=True, trust_env=False) as client:
+            async with self._session_client(follow_redirects=True) as client:
                 response = await client.get("https://m.weibo.cn/api/config", headers=DEFAULT_HEADERS)
+                if response.status_code == 401:
+                    return {"login": False, "uid": None}
                 response.raise_for_status()
-                data = response.json().get("data", {})
+                data = self._response_json(response).get("data")
+                if not isinstance(data, dict) or "login" not in data:
+                    raise WeiboError("微博登录状态响应异常，无法确定是否登录")
                 if data.get("st"):
                     self.cookies["XSRF-TOKEN"] = data["st"]
                 return {"login": bool(data.get("login")), "uid": data.get("uid")}
-        except (httpx.HTTPError, ValueError):
-            return {"login": False, "uid": None}
+        except (httpx.HTTPError, ValueError) as exc:
+            raise WeiboError("微博登录状态检查失败，请稍后重试；这不代表登录已失效") from exc
 
     async def _require_authenticated(self) -> None:
         if not (await self.get_session()).get("login"):
@@ -229,6 +301,8 @@ class WeiboCrawler:
 
     async def qr_login(self, timeout: int = 240) -> dict:
         """Log in with the Weibo app QR scanner and persist the resulting cookies."""
+        if self._uses_cookie_env:
+            print("注意：WEIBO_COOKIE 优先于扫码凭证；其他服务进程需移除该环境变量并重启，才能使用本次登录。")
         params = {"entry": "miniblog", "source": "miniblog", "url": "https://weibo.com/"}
         async with httpx.AsyncClient(
             base_url="https://passport.weibo.com",
@@ -308,7 +382,7 @@ class WeiboCrawler:
     async def get_home_timeline(self, limit: int = 20, page: int = 1) -> list[FeedItem]:
         """Get the logged-in user's following timeline."""
         await self._require_authenticated()
-        async with httpx.AsyncClient(cookies=self.cookies, follow_redirects=True, trust_env=False) as client:
+        async with self._session_client(follow_redirects=True) as client:
             max_id = "0"
             for current_page in range(1, max(page, 1) + 1):
                 params = {
@@ -350,7 +424,7 @@ class WeiboCrawler:
 
     async def _friendship_action(self, action: str, uid: int, uid_field: str) -> dict:
         await self._require_authenticated()
-        async with httpx.AsyncClient(cookies=self.cookies, follow_redirects=True, trust_env=False) as client:
+        async with self._session_client(follow_redirects=True) as client:
             await client.get("https://weibo.com/", headers=WEB_HEADERS)
             xsrf = self._cookie_value(client.cookies, "XSRF-TOKEN")
             if not xsrf:
@@ -378,7 +452,7 @@ class WeiboCrawler:
             UserProfile: User profile information or empty dict if extraction fails
         """
         await self._ensure_cookies()
-        async with httpx.AsyncClient(cookies=self.cookies, trust_env=False) as client:
+        async with self._session_client() as client:
             try:
                 response=await client.get(PROFILE_URL.format(userId=uid), headers=DEFAULT_HEADERS)
                 result=self._response_json(response)
@@ -402,7 +476,7 @@ class WeiboCrawler:
         feeds=[]
         sinceId=''
         await self._ensure_cookies()
-        async with httpx.AsyncClient(cookies=self.cookies, trust_env=False) as client:
+        async with self._session_client() as client:
             containerId=await self._get_container_id(client, uid)
 
             while len(feeds) < limit:
@@ -429,7 +503,7 @@ class WeiboCrawler:
             list[FeedItem]: List of hot feeds from the user's profile
         """
         await self._ensure_cookies()
-        async with httpx.AsyncClient(cookies=self.cookies, trust_env=False) as client:
+        async with self._session_client() as client:
             try:
                 params={
                     'containerid': f'231002{str(uid)}_-_HOTMBLOG',
@@ -462,7 +536,7 @@ class WeiboCrawler:
             list[UserProfile]: List of UserProfile objects containing user information
         """
         await self._ensure_cookies()
-        async with httpx.AsyncClient(cookies=self.cookies, trust_env=False) as client:
+        async with self._session_client() as client:
             try:
                 params={
                     'containerid': f'100103type=3&q={keyword}',
@@ -502,7 +576,7 @@ class WeiboCrawler:
             encoded_params=urlencode(params)
 
             await self._ensure_cookies()
-            async with httpx.AsyncClient(cookies=self.cookies, trust_env=False) as client:
+            async with self._session_client() as client:
                 response=await client.get(f'{SEARCH_URL}?{encoded_params}', headers=DEFAULT_HEADERS)
                 data=self._response_json(response)
                 cards=data.get('data', {}).get('cards', [])
@@ -548,7 +622,7 @@ class WeiboCrawler:
                 }
                 encoded_params=urlencode(params)
 
-                async with httpx.AsyncClient(cookies=self.cookies, trust_env=False) as client:
+                async with self._session_client() as client:
                     response=await client.get(f'{SEARCH_URL}?{encoded_params}', headers=DEFAULT_HEADERS)
                     data=self._response_json(response)
 
@@ -591,7 +665,7 @@ class WeiboCrawler:
             list[dict: List of dict containing topic search results
         """
         await self._ensure_cookies()
-        async with httpx.AsyncClient(cookies=self.cookies, trust_env=False) as client:
+        async with self._session_client() as client:
             try:
                 params={
                     'containerid': f'100103type=38&q={keyword}',
@@ -626,7 +700,7 @@ class WeiboCrawler:
         """
         try:
             await self._ensure_cookies()
-            async with httpx.AsyncClient(cookies=self.cookies, trust_env=False) as client:
+            async with self._session_client() as client:
                 url=COMMENTS_URL.format(feed_id=feed_id, page=page)
                 response=await client.get(url, headers=DEFAULT_HEADERS)
                 data=self._response_json(response)
@@ -650,7 +724,7 @@ class WeiboCrawler:
             list[UserProfile]: List of UserProfile objects containing follower information
         """
         await self._ensure_cookies()
-        async with httpx.AsyncClient(cookies=self.cookies, trust_env=False) as client:
+        async with self._session_client() as client:
             try:
                 params={
                     'containerid': f'231051_-_followers_-_{str(uid)}',
@@ -684,7 +758,7 @@ class WeiboCrawler:
             list[UserProfile]: List of UserProfile objects containing fan information
         """
         await self._ensure_cookies()
-        async with httpx.AsyncClient(cookies=self.cookies, trust_env=False) as client:
+        async with self._session_client() as client:
             try:
                 params={
                     'containerid': f'231051_-_fans_-_{str(uid)}',
