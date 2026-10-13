@@ -297,3 +297,32 @@ async def test_cookie_deletion_is_saved(tmp_path, monkeypatch, expiry):
     async with crawler._session_client() as client:
         await client.get("https://weibo.com/")
     assert WeiboCrawler(crawler.cookie_file).cookies == {"SUB": "user"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deletion_first", [True, False])
+async def test_domain_cookie_deletion_preserves_new_token(tmp_path, monkeypatch, deletion_first):
+    monkeypatch.delenv("WEIBO_COOKIE", raising=False)
+    crawler = WeiboCrawler(tmp_path / "cookies.json")
+    crawler.save_cookies({"SUB": "user", "XSRF-TOKEN": "old"})
+    headers = [
+        ("set-cookie", "XSRF-TOKEN=; Domain=.weibo.cn; Path=/; Max-Age=0"),
+        ("set-cookie", "XSRF-TOKEN=fresh; Domain=m.weibo.cn; Path=/; Max-Age=1200"),
+    ]
+    if not deletion_first:
+        headers.reverse()
+    sent = []
+
+    def handler(request):
+        sent.append(request.headers.get("cookie"))
+        return httpx.Response(200, headers=headers if len(sent) == 1 else [])
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(weibo.httpx, "AsyncClient", lambda **kw: real_client(
+        transport=httpx.MockTransport(handler), **kw))
+    async with crawler._session_client() as client:
+        await client.get("https://m.weibo.cn/api/config")
+        await client.get("https://m.weibo.cn/api/config")
+    assert "XSRF-TOKEN=fresh" in sent[1]
+    assert "XSRF-TOKEN=old" not in sent[1]
+    assert WeiboCrawler(crawler.cookie_file).cookies == {"SUB": "user", "XSRF-TOKEN": "fresh"}

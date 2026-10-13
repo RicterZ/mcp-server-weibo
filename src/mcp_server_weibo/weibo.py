@@ -198,7 +198,8 @@ class WeiboCrawler:
                     except (ValueError, TypeError, OverflowError):
                         continue
                     if expired:
-                        changes[name] = None
+                        # A deletion for one domain must not erase another domain's new value.
+                        changes.setdefault(name, None)
             for name, value in changes.items():
                 if updated.get(name) != original.get(name):
                     continue
@@ -211,6 +212,13 @@ class WeiboCrawler:
                     if existing.name == name and not existing.domain:
                         client.cookies.jar.clear(existing.domain, existing.path, existing.name)
             if updated != self.cookies:
+                self.logger.info(
+                    "Weibo cookie rotation from %s: updated=%s deleted=%s",
+                    host,
+                    sorted(name for name in changes if name in updated and
+                           updated.get(name) != (self.cookies or {}).get(name)),
+                    sorted(set(self.cookies or {}) - set(updated)),
+                )
                 if self._uses_cookie_env or signature is None:
                     self.cookies = updated
                 else:
