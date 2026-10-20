@@ -180,6 +180,8 @@ class WeiboCrawler:
                        for domain in ("weibo.com", "weibo.cn", "sina.com.cn")):
                 return
             if not self._uses_cookie_env and self._get_cookie_file_signature() != signature:
+                self.logger.warning("Weibo cookie response ignored: host=%s status=%s reason=file-changed",
+                                    host, response.status_code)
                 return
             updated = dict(self.cookies or {})
             changes = {cookie.name: cookie.value for cookie in response.cookies.jar}
@@ -188,6 +190,11 @@ class WeiboCrawler:
                 parsed = SimpleCookie()
                 parsed.load(header)
                 for name, morsel in parsed.items():
+                    self.logger.warning(
+                        "Weibo Set-Cookie: host=%s status=%s name=%s domain=%s max_age=%s expires=%s",
+                        host, response.status_code, name, morsel["domain"],
+                        morsel["max-age"], morsel["expires"],
+                    )
                     domain = morsel["domain"].lstrip(".")
                     if domain and host != domain and not host.endswith("." + domain):
                         continue
@@ -212,7 +219,7 @@ class WeiboCrawler:
                     if existing.name == name and not existing.domain:
                         client.cookies.jar.clear(existing.domain, existing.path, existing.name)
             if updated != self.cookies:
-                self.logger.info(
+                self.logger.warning(
                     "Weibo cookie rotation from %s: updated=%s deleted=%s",
                     host,
                     sorted(name for name in changes if name in updated and
@@ -226,6 +233,11 @@ class WeiboCrawler:
                     signature = self._cookie_file_signature
                 original.clear()
                 original.update(updated)
+            if not {"SUB", "SUBP"}.issubset(updated):
+                self.logger.warning(
+                    "Weibo auth cookies incomplete: host=%s status=%s SUB_present=%s SUBP_present=%s",
+                    host, response.status_code, bool(updated.get("SUB")), bool(updated.get("SUBP")),
+                )
 
         async with httpx.AsyncClient(
             cookies=self.cookies, trust_env=False,

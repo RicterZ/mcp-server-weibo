@@ -326,3 +326,23 @@ async def test_domain_cookie_deletion_preserves_new_token(tmp_path, monkeypatch,
     assert "XSRF-TOKEN=fresh" in sent[1]
     assert "XSRF-TOKEN=old" not in sent[1]
     assert WeiboCrawler(crawler.cookie_file).cookies == {"SUB": "user", "XSRF-TOKEN": "fresh"}
+
+
+@pytest.mark.asyncio
+async def test_cookie_diagnostics_visible_without_exposing_values(tmp_path, monkeypatch, caplog):
+    monkeypatch.delenv("WEIBO_COOKIE", raising=False)
+    crawler = WeiboCrawler(tmp_path / "cookies.json")
+    crawler.save_cookies({"SUB": "secret-session", "SUBP": "secret-profile"})
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(weibo.httpx, "AsyncClient", lambda **kw: real_client(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, headers=[
+            ("set-cookie", "SUB=; Domain=.weibo.cn; Path=/; Max-Age=0"),
+            ("set-cookie", "XSRF-TOKEN=secret-token; Domain=m.weibo.cn; Path=/; Max-Age=1200"),
+        ])), **kw))
+    async with crawler._session_client() as client:
+        await client.get("https://m.weibo.cn/api/config?private=secret-query")
+    assert "name=SUB domain=.weibo.cn max_age=0" in caplog.text
+    assert "name=XSRF-TOKEN domain=m.weibo.cn max_age=1200" in caplog.text
+    assert "deleted=['SUB']" in caplog.text
+    assert "SUB_present=False SUBP_present=True" in caplog.text
+    assert "secret-" not in caplog.text
