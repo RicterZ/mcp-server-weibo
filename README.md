@@ -32,6 +32,14 @@ WEIBO_COOKIE='SUB=...; SUBP=...; XSRF-TOKEN=...' mcp-server-weibo stdio
 
 用 `WEIBO_COOKIE_FILE` 可以覆盖凭证文件路径。Cookie 等同登录凭证，请勿提交到 Git 或写入普通 MCP 配置文件。
 
+也可以直接让 agent 通过 MCP 登录，无需进入服务器终端：
+
+1. 调用 `start_qr_login()`，立即返回 PNG 格式的 MCP 图片内容，以及 `structuredContent` 中的 `login_id`、`status` 和 `expires_in`。Agent 可以将二维码图片展示或发送给用户。
+2. 用户用微博 App 扫码并确认后，调用 `check_qr_login(login_id)`。返回状态为 `waiting`（待扫码）、`scanned`（待手机确认）、`expired`（已过期）或 `authenticated`（登录成功，包含 UID）。重复查询至少间隔 2 秒。
+3. 登录成功后凭证自动保存，当前 MCP 服务立即使用新账号，无需重启。工具不会返回 Cookie。
+
+二维码有效期最多 240 秒；过期或服务重启后需要重新获取。每个服务只保留一个登录尝试，重新获取二维码会替换上一次尝试。登录账号由该服务的所有 MCP 客户端共享。如果配置了 `WEIBO_COOKIE`，需要先移除该变量并重启服务，才能使用 MCP 扫码登录。Docker 部署时继续挂载凭证卷即可持久保存登录状态。
+
 MCP 客户端配置（stdio 模式）：
 ```json
 {
@@ -150,6 +158,8 @@ uvx --from mcp-server-weibo weibo-cli fans 1749127163 -n 10
 
 | 工具 | 说明 |
 |------|------|
+| `start_qr_login()` | 返回可直接展示/发送的二维码图片和 `login_id` |
+| `check_qr_login(login_id)` | 查询扫码结果，验证成功后保存并应用登录凭证 |
 | `get_session()` | 校验当前 Cookie，返回登录状态和 UID（不会返回 Cookie） |
 | `get_home_timeline(limit, page)` | 获取所关注用户的首页 timeline |
 | `follow_user(uid)` | 以当前账号关注用户 |

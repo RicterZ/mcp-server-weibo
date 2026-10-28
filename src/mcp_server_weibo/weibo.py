@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 import time
 from http.cookies import SimpleCookie
@@ -7,6 +8,8 @@ import json
 import logging
 import os
 import re
+import secrets
+from io import BytesIO
 import tempfile
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -35,6 +38,15 @@ class WeiboError(RuntimeError):
     """A user-facing error returned by the Weibo API integration."""
 
 
+@dataclass
+class _QRLogin:
+    login_id: str
+    qrid: str
+    scan_url: str
+    cookies: httpx.Cookies
+    expires_at: float
+
+
 class WeiboCrawler:
     """
     A crawler class for extracting data from Weibo (Chinese social media platform).
@@ -52,6 +64,8 @@ class WeiboCrawler:
         self._uses_cookie_env = False
         self._cookie_file_signature: tuple[int, int, int, int] | None = None
         self.cookies = self._load_cookies()
+        self._qr_login: _QRLogin | None = None
+        self._qr_lock = asyncio.Lock()
 
     @staticmethod
     def _response_json(response: httpx.Response) -> dict:
@@ -62,7 +76,8 @@ class WeiboCrawler:
             {"passport.weibo.com", "passport.weibo.cn", "login.sina.com.cn"}
         ):
             raise WeiboError(
-                "微博 Cookie 已失效或未登录，请重新登录：`mcp-server-weibo login`"
+                "微博 Cookie 已失效或未登录，请通过 start_qr_login / check_qr_login 工具重新扫码，"
+                "或运行 `mcp-server-weibo login`"
             )
         if response.is_redirect or response.status_code == 403:
             raise WeiboError("微博接口拒绝访问或发生跳转，无法据此判断登录已失效")
@@ -317,81 +332,133 @@ class WeiboCrawler:
 
     async def _require_authenticated(self) -> None:
         if not (await self.get_session()).get("login"):
-            raise RuntimeError("Weibo login is missing or expired; run `mcp-server-weibo login`")
+            raise RuntimeError(
+                "Weibo login is missing or expired; use start_qr_login / check_qr_login "
+                "or run `mcp-server-weibo login`"
+            )
 
-    async def qr_login(self, timeout: int = 240) -> dict:
-        """Log in with the Weibo app QR scanner and persist the resulting cookies."""
-        if self._uses_cookie_env:
-            print("注意：WEIBO_COOKIE 优先于扫码凭证；其他服务进程需移除该环境变量并重启，才能使用本次登录。")
-        params = {"entry": "miniblog", "source": "miniblog", "url": "https://weibo.com/"}
-        async with httpx.AsyncClient(
+    @staticmethod
+    def _qr_client(cookies=None) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
             base_url="https://passport.weibo.com",
             headers=PASSPORT_HEADERS,
+            cookies=cookies,
             follow_redirects=True,
             timeout=30,
             trust_env=False,
-        ) as client:
-            response = await client.get("/sso/signin", params=params)
-            response.raise_for_status()
-            csrf = self._cookie_value(client.cookies, "X-CSRF-TOKEN")
-            if not csrf:
-                raise RuntimeError("Weibo did not return a QR login CSRF token")
+        )
+
+    async def _create_qr_login(self, client: httpx.AsyncClient, timeout: int) -> _QRLogin:
+        params = {"entry": "miniblog", "source": "miniblog", "url": "https://weibo.com/"}
+        response = await client.get("/sso/signin", params=params)
+        response.raise_for_status()
+        csrf = self._cookie_value(client.cookies, "X-CSRF-TOKEN")
+        if not csrf:
+            raise RuntimeError("Weibo did not return a QR login CSRF token")
+        client.headers["X-CSRF-TOKEN"] = csrf
+        response = await client.get("/sso/v2/qrcode/image", params={"entry": "miniblog", "size": "180"})
+        response.raise_for_status()
+        payload = self._response_json(response)
+        if payload.get("retcode") != 20000000:
+            raise RuntimeError(payload.get("msg", "Unable to create Weibo login QR code"))
+        qrid = payload["data"]["qrid"]
+        image_url = payload["data"].get("image", "")
+        scan_url = parse_qs(urlparse(image_url).query).get(
+            "data", [f"https://passport.weibo.cn/signin/qrcode/scan?qr={qrid}"]
+        )[0]
+        return _QRLogin(secrets.token_urlsafe(32), qrid, scan_url,
+                        client.cookies, time.monotonic() + timeout)
+
+    async def _poll_qr_login(self, client: httpx.AsyncClient, login: _QRLogin) -> dict:
+        csrf = self._cookie_value(client.cookies, "X-CSRF-TOKEN")
+        if csrf:
             client.headers["X-CSRF-TOKEN"] = csrf
-
-            response = await client.get("/sso/v2/qrcode/image", params={"entry": "miniblog", "size": "180"})
-            response.raise_for_status()
-            payload = response.json()
-            if payload.get("retcode") != 20000000:
-                raise RuntimeError(payload.get("msg", "Unable to create Weibo login QR code"))
-            qrid = payload["data"]["qrid"]
-            image_url = payload["data"].get("image", "")
-            scan_url = parse_qs(urlparse(image_url).query).get(
-                "data", [f"https://passport.weibo.cn/signin/qrcode/scan?qr={qrid}"]
-            )[0]
-
-            print("\n请使用微博 App 扫描二维码，并在手机上确认登录：\n")
-            qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_L, border=1)
-            qr.add_data(scan_url)
-            qr.make(fit=True)
-            qr.print_ascii(invert=True)
-            print("\n等待扫码（最多 4 分钟）…", flush=True)
-
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + timeout
-            scanned = False
-            while loop.time() < deadline:
+        response = await client.get(
+            "/sso/v2/qrcode/check",
+            params={"entry": "miniblog", "source": "miniblog", "url": "https://weibo.com/",
+                    "qrid": login.qrid, "rid": "", "ver": "20250520"},
+        )
+        payload = self._response_json(response)
+        retcode = payload.get("retcode")
+        if retcode == 20000000:
+            data = payload.get("data", {})
+            if alt := data.get("alt"):
                 response = await client.get(
-                    "/sso/v2/qrcode/check",
-                    params={**params, "qrid": qrid, "rid": "", "ver": "20250520"},
+                    "/sso/v2/login",
+                    params={"entry": "miniblog", "alt": alt, "returntype": "META"},
                 )
                 response.raise_for_status()
-                payload = self._response_json(response)
-                retcode = payload.get("retcode")
-                if retcode == 20000000:
-                    data = payload.get("data", {})
-                    if alt := data.get("alt"):
-                        response = await client.get(
-                            "/sso/v2/login",
-                            params={"entry": "miniblog", "alt": alt, "returntype": "META"},
-                        )
-                        response.raise_for_status()
-                    elif cross_url := data.get("url"):
-                        await client.get(cross_url)
-                    cookies = {cookie.name: cookie.value for cookie in client.cookies.jar}
-                    if not await self._validate_cookies(cookies):
-                        names = ", ".join(sorted(cookies)) or "none"
-                        raise RuntimeError(
-                            f"QR scan completed, but Weibo did not create a valid session (cookie names: {names})"
-                        )
-                    self.save_cookies(cookies)
-                    return await self.get_session()
-                if retcode == 50114002 and not scanned:
+            elif cross_url := data.get("url"):
+                response = await client.get(cross_url)
+                response.raise_for_status()
+            cookies = {cookie.name: cookie.value for cookie in client.cookies.jar}
+            if not await self._validate_cookies(cookies):
+                raise RuntimeError("QR scan completed, but Weibo did not create a valid session")
+            self.save_cookies(cookies)
+            session = await self.get_session()
+            if not session.get("login"):
+                raise RuntimeError("Weibo session expired after QR login; please try again")
+            return {"status": "authenticated", **session}
+        if retcode == 50114001:
+            return {"status": "waiting"}
+        if retcode == 50114002:
+            return {"status": "scanned"}
+        if retcode == 50114004:
+            return {"status": "expired"}
+        raise RuntimeError(payload.get("msg", f"QR login failed ({retcode})"))
+
+    async def start_qr_login(self) -> tuple[dict, bytes]:
+        """Create a QR image immediately; a new attempt replaces the previous one."""
+        if self._uses_cookie_env:
+            raise RuntimeError("Remove WEIBO_COOKIE and restart the server before using MCP QR login")
+        async with self._qr_lock:
+            async with self._qr_client() as client:
+                login = await self._create_qr_login(client, 240)
+            image = BytesIO()
+            qrcode.make(login.scan_url).save(image, format="PNG")
+            self._qr_login = login
+            return {"login_id": login.login_id, "status": "waiting", "expires_in": 240}, image.getvalue()
+
+    async def check_qr_login(self, login_id: str) -> dict:
+        """Check once without background polling, and save verified credentials."""
+        async with self._qr_lock:
+            login = self._qr_login
+            if login is None or not secrets.compare_digest(login.login_id.encode(), login_id.encode()):
+                raise RuntimeError("Unknown login_id; call start_qr_login to get a new QR code")
+            if time.monotonic() >= login.expires_at:
+                self._qr_login = None
+                return {"status": "expired"}
+            async with self._qr_client(login.cookies) as client:
+                try:
+                    result = await self._poll_qr_login(client, login)
+                finally:
+                    login.cookies = client.cookies
+            if result["status"] in {"authenticated", "expired"}:
+                self._qr_login = None
+            return result
+
+    async def qr_login(self, timeout: int = 240) -> dict:
+        """Log in with the terminal QR scanner and persist the resulting cookies."""
+        if self._uses_cookie_env:
+            print("注意：WEIBO_COOKIE 优先于扫码凭证；其他服务进程需移除该环境变量并重启，才能使用本次登录。")
+        async with self._qr_client() as client:
+            login = await self._create_qr_login(client, timeout)
+            print("\n请使用微博 App 扫描二维码，并在手机上确认登录：\n")
+            qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_L, border=1)
+            qr.add_data(login.scan_url)
+            qr.make(fit=True)
+            qr.print_ascii(invert=True)
+            print(f"\n等待扫码（最多 {timeout} 秒）…", flush=True)
+            scanned = False
+            while time.monotonic() < login.expires_at:
+                result = await self._poll_qr_login(client, login)
+                if result["status"] == "authenticated":
+                    return {"login": True, "uid": result["uid"]}
+                if result["status"] == "expired":
+                    raise RuntimeError("Weibo login QR code expired")
+                if result["status"] == "scanned" and not scanned:
                     print("已扫码，请在手机上确认…", flush=True)
                     scanned = True
-                elif retcode == 50114004:
-                    raise RuntimeError("Weibo login QR code expired")
-                elif retcode not in (50114001, 50114002):
-                    raise RuntimeError(payload.get("msg", f"QR login failed ({retcode})"))
                 await asyncio.sleep(2)
         raise RuntimeError("Weibo login QR code timed out")
 

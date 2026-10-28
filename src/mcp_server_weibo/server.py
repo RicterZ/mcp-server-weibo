@@ -1,12 +1,13 @@
 from fastmcp import FastMCP, Context
 from fastmcp.server.middleware import Middleware, MiddlewareContext, CallNext
 from fastmcp.tools.tool import ToolResult
-from mcp.types import CallToolRequestParams
+from mcp.types import CallToolRequestParams, ImageContent
 from .weibo import WeiboCrawler
 from typing import Annotated
 from pydantic import Field
 import argparse
 import asyncio
+import base64
 import os
 
 class StructuredContentOnly(Middleware):
@@ -19,8 +20,8 @@ class StructuredContentOnly(Middleware):
     ) -> ToolResult:
         result = await call_next(context)
         if result.structured_content is not None:
-            # Keep MCP's required content field, but omit the redundant payload.
-            result.content = []
+            # Omit redundant JSON text while preserving images and other media.
+            result.content = [block for block in result.content if block.type != "text"]
         return result
 
 
@@ -179,6 +180,32 @@ async def get_comments(
         list[dict]: List of dictionaries containing comments
     """
     return await get_crawler().get_comments(feed_id, page)
+
+@mcp.tool()
+async def start_qr_login(ctx: Context) -> ToolResult:
+    """Start login to the server's shared Weibo account. Return a PNG QR image
+    to display/send to the user for scanning with the Weibo app. Then call
+    check_qr_login with login_id after they confirm. Expires in 240 seconds;
+    starting again replaces the previous attempt. Cookies are never returned.
+    """
+    metadata, image = await get_crawler().start_qr_login()
+    return ToolResult(
+        content=[ImageContent(type="image", mimeType="image/png",
+                              data=base64.b64encode(image).decode("ascii"))],
+        structured_content=metadata,
+    )
+
+@mcp.tool()
+async def check_qr_login(
+    ctx: Context,
+    login_id: Annotated[str, Field(description="login_id returned by start_qr_login")],
+) -> dict:
+    """Check QR login once: waiting, scanned (awaiting phone confirmation),
+    expired, or authenticated (with UID). Wait at least 2 seconds between checks.
+    Successful login saves credentials and immediately updates this server's
+    shared account. On expiry call start_qr_login again.
+    """
+    return await get_crawler().check_qr_login(login_id)
 
 @mcp.tool()
 async def get_session(ctx: Context) -> dict:

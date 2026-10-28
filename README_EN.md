@@ -12,6 +12,14 @@ Weibo Data API Server powered by Model Context Protocol - Real-time access to We
 
 **Automatic Cookie Generation:** No manual cookie configuration required. The server automatically generates valid access credentials through Weibo's visitor passport system.
 
+Authenticated features also support QR login directly through MCP:
+
+1. Call `start_qr_login()`. It immediately returns a PNG MCP image for the agent to display/send, plus `login_id`, `status`, and `expires_in` in `structuredContent`.
+2. Scan with the Weibo app and confirm on the phone, then call `check_qr_login(login_id)`. The status is `waiting`, `scanned`, `expired`, or `authenticated` (including UID). Leave at least 2 seconds between checks.
+3. Successful login saves credentials and updates the running server immediately. Cookies are never returned.
+
+QR codes expire after at most 240 seconds. Starting again replaces the previous attempt; restarting the server also requires a new attempt. All clients of a server share its logged-in account. Remove `WEIBO_COOKIE` and restart before using MCP QR login if that override is configured. Credentials use `WEIBO_COOKIE_FILE` or `~/.config/mcp-server-weibo/cookies.json`; Docker deployments should persist this file in a volume. Terminal login remains available with `mcp-server-weibo login` or `weibo-cli login`.
+
 ### Option 1: From Package Manager (Recommended)
 
 ```bash

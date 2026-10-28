@@ -101,6 +101,8 @@ class TestServerTools:
             "get_fans",
             "get_comments",
             "get_session",
+            "start_qr_login",
+            "check_qr_login",
             "get_home_timeline",
             "follow_user",
             "unfollow_user",
